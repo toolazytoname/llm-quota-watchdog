@@ -304,7 +304,10 @@ def cmd_watchdog(cfg, summary_mode):
                 ds = state.get(dkey)
                 if not ds or ds.get("date") != today:
                     ds = {"date": today, "pct": pct}
-                    state[dkey] = ds
+                if pct < ds.get("pct", pct):
+                    # window refilled today; count burn from zero
+                    ds = {"date": today, "pct": 0}
+                state[dkey] = ds
                 today_used = pct - ds.get("pct", pct)
                 okey = "overspend|%s|%s|%s" % (acct, win, today)
                 if today_used >= DAILY_BUDGET * th["daily_overspend_factor"] and not state.get(okey):
@@ -496,7 +499,8 @@ def cmd_page(cfg):
                 if win == "7d" and pct is not None:
                     ds = state.get("daystart|%s|7d" % name) or {}
                     if ds.get("date") == today:
-                        burn = pct - ds.get("pct", pct)
+                        base = ds.get("pct", pct)
+                        burn = pct - base if pct >= base else pct
                         note = "今日已用 %+.1f%%（匀速预算 %.1f%%/天）" % (burn, DAILY_BUDGET)
                 rows.append(window_html(cfg, "5小时用量" if win == "5h" else "7天用量", pct, reset, note))
         expiry_html = ""
