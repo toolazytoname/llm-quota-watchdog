@@ -303,17 +303,16 @@ def cmd_watchdog(cfg, summary_mode):
                     alerts.append("【满血复活】%s %s额度已重置，当前已用 %s"
                                   % (acct, "5h" if win == "5h" else "周", fmt_pct(pct)))
                     state[rkey] = True
-            # nearly-used-up (all accounts, including relaxed)
-            # 5h cap with a healthy weekly balance is just a natural throttle —
-            # only alert when the weekly window is also tight
-            if win == "5h":
-                week_pct = (q.get("7d") or (None, None))[0]
-                if week_pct is not None and week_pct < 70:
-                    continue
+            # nearly-used-up (all accounts, with reset countdown for sprint planning)
             limit = th["high_5h"] if win == "5h" else th["high_week"]
             key = acct + "|" + win + "|high"
             if pct >= limit and not state.get(key):
-                alerts.append("【快用完】%s %s窗口已用 %s（≥%d%%）" % (acct, win, fmt_pct(pct), limit))
+                eta = ""
+                if reset is not None:
+                    hrs = (reset - now).total_seconds() / 3600
+                    if hrs > 0:
+                        eta = "，%.1f小时后重置可继续" % hrs if hrs < 24 else "，%.1f天后重置" % (hrs / 24)
+                alerts.append("【快用完】%s %s窗口已用 %s（≥%d%%）%s" % (acct, win, fmt_pct(pct), limit, eta))
                 state[key] = True
             elif pct < limit - 15:
                 state.pop(key, None)
