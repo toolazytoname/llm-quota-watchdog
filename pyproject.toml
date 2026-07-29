@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-quota-watchdog"
+version = "1.1.0"
+description = "One dashboard + smart push alerts for LLM coding-plan quotas — Claude Pro/Max, Codex Plus/Pro, Kimi for Coding"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+keywords = ["llm", "quota", "claude", "codex", "kimi", "dashboard", "alerts"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Chinese (Simplified)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://github.com/toolazytoname/llm-quota-watchdog"
+Repository = "https://github.com/toolazytoname/llm-quota-watchdog"
+
+[project.scripts]
+llm-quota-watchdog = "quota_watchdog.app:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov>=4", "ruff>=0.1"]
+
+[tool.setuptools.packages.find]
+include = ["quota_watchdog*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP"]
+ignore = ["E501", "UP031"]
+
+[tool.coverage.run]
+source = ["quota_watchdog"]
+omit = ["tests/*"]
+branch = true
