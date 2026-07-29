@@ -31,7 +31,7 @@ Per account: 5-hour / weekly progress bars with exact percentages, reset countdo
 
 | Alert | Trigger |
 |---|---|
-| 🔴 Nearly used up | 5h window ≥ 80%, weekly ≥ 90% |
+| 🔴 Nearly used up | weekly ≥ 90% · 5h ≥ 80% (5h only alerts when weekly is also ≥ 70% — riding the 5h cap with a healthy weekly balance is just a natural throttle) |
 | 🟠 Burning too fast | usage 15 points ahead of time pace in the weekly window |
 | ⏱ Pace indicator | every window shows time elapsed vs. usage — fast/slow at a glance |
 | 🟡 Use it or lose it | half the window gone but usage 30+ points behind · or ≤26h to reset with ≤60% used |

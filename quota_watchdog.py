@@ -304,6 +304,12 @@ def cmd_watchdog(cfg, summary_mode):
                                   % (acct, "5h" if win == "5h" else "周", fmt_pct(pct)))
                     state[rkey] = True
             # nearly-used-up (all accounts, including relaxed)
+            # 5h cap with a healthy weekly balance is just a natural throttle —
+            # only alert when the weekly window is also tight
+            if win == "5h":
+                week_pct = (q.get("7d") or (None, None))[0]
+                if week_pct is not None and week_pct < 70:
+                    continue
             limit = th["high_5h"] if win == "5h" else th["high_week"]
             key = acct + "|" + win + "|high"
             if pct >= limit and not state.get(key):
