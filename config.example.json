@@ -1,0 +1,35 @@
+{
+  "bark_url": "https://api.day.app/YOUR_BARK_KEY/",
+  "ntfy_url": "",
+  "cliproxyapi_auth_dir": "~/.cli-proxy-api",
+  "accounts": [
+    {
+      "type": "kimi",
+      "label": "Kimi Coding",
+      "api_key_file": "~/.config/llm-quota-watchdog/kimi-key"
+    }
+  ],
+  "relaxed_accounts": [],
+  "plan_expiry": {
+    "Kimi Coding": "2026-08-22"
+  },
+  "monthly_snapshot": {
+    "Kimi Coding": { "pct": 21.4, "reset": "2026-08-22", "updated": "2026-07-29" }
+  },
+  "thresholds": {
+    "high_5h": 80,
+    "high_week": 90,
+    "fast_margin": 15,
+    "daily_overspend_factor": 1.5,
+    "waste_mid_elapsed": 50,
+    "waste_margin": 30,
+    "waste_hours_left": 26,
+    "waste_pct": 60,
+    "refill_drop": 30,
+    "expiry_alert_days": [7, 3, 1]
+  },
+  "timezone_offset_hours": 8,
+  "state_file": "~/.local/share/llm-quota-watchdog/quota-watchdog-state.json",
+  "page_out_dir": "~/.local/share/llm-quota-watchdog/www",
+  "log_file": "~/.local/share/llm-quota-watchdog/quota-watchdog.log"
+}

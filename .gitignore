@@ -1,0 +1,7 @@
+# local config & runtime data — never commit these
+config.json
+*-state.json
+*.log
+www/
+__pycache__/
+.DS_Store
