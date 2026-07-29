@@ -25,7 +25,7 @@ llm-quota-watchdog polls the same endpoints the official CLIs use, renders a sin
 
 Per account: 5-hour / weekly progress bars with exact percentages and reset countdowns, daily burn vs. fair-share budget, plan expiry countdown. Dark, mobile-friendly.
 
-<!-- add docs/screenshot.png -->
+![dashboard](docs/screenshot.png)
 
 ### Push alerts (Bark / ntfy)
 

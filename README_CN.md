@@ -25,7 +25,7 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 
 每个账号：5 小时 / 每周进度条、精确百分比、重置倒计时、今日消耗 vs 匀速预算、套餐到期倒计时。深色主题，手机友好。
 
-<!-- 待补充 docs/screenshot.png -->
+![dashboard](docs/screenshot.png)
 
 ### 推送告警（Bark / ntfy）
 
