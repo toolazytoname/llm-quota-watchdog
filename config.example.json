@@ -20,7 +20,6 @@
     "high_5h": 80,
     "high_week": 90,
     "fast_margin": 15,
-    "daily_overspend_factor": 1.5,
     "waste_mid_elapsed": 50,
     "waste_margin": 30,
     "waste_hours_left": 26,

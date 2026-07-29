@@ -23,7 +23,7 @@ llm-quota-watchdog polls the same endpoints the official CLIs use, renders a sin
 
 ### Dashboard (static HTML, regenerate on cron)
 
-Per account: 5-hour / weekly progress bars with exact percentages and reset countdowns, daily burn vs. fair-share budget, plan expiry countdown. Dark, mobile-friendly.
+Per account: 5-hour / weekly progress bars with exact percentages, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. Dark, mobile-friendly.
 
 ![dashboard](docs/screenshot.png)
 
@@ -33,7 +33,7 @@ Per account: 5-hour / weekly progress bars with exact percentages and reset coun
 |---|---|
 | 🔴 Nearly used up | 5h window ≥ 80%, weekly ≥ 90% |
 | 🟠 Burning too fast | usage 15 points ahead of time pace in the weekly window |
-| 🟠 Daily overspend | today's burn ≥ 1.5× daily fair share (weekly ÷ 7) |
+| ⏱ Pace indicator | every window shows time elapsed vs. usage — fast/slow at a glance |
 | 🟡 Use it or lose it | half the window gone but usage 30+ points behind · or ≤26h to reset with ≤60% used |
 | 🟢 Refilled | window reset detected (usage dropped 30+ points) |
 | 📅 Plan expiring | 7 / 3 / 1 days before a manually-configured plan expiry date |

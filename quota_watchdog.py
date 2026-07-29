@@ -44,7 +44,6 @@ THRESH = {
     "high_5h": 80,                  # nearly-used-up: 5h window %
     "high_week": 90,                # nearly-used-up: weekly window %
     "fast_margin": 15,              # burning-too-fast: usage ahead of time pace (points)
-    "daily_overspend_factor": 1.5,  # overspend: today burn >= factor * daily budget
     "waste_mid_elapsed": 50,        # mid-cycle waste: elapsed >= this %
     "waste_margin": 30,             # ...and usage behind by this many points
     "waste_hours_left": 26,         # near-reset waste: reset within this many hours
@@ -52,9 +51,6 @@ THRESH = {
     "refill_drop": 30,              # refill detection: drop of this many points
     "expiry_alert_days": [7, 3, 1],
 }
-
-DAILY_BUDGET = 100.0 / 7
-
 
 # ---------------------------------------------------------------- utils
 
@@ -246,6 +242,26 @@ def push(cfg, title, body):
 
 # ---------------------------------------------------------------- watchdog
 
+WIN_SECONDS = {"5h": 5 * 3600, "7d": 7 * 86400}
+
+def pace_info(pct, reset, win):
+    """Compare usage pct against fair pace (elapsed time fraction of the window)."""
+    if pct is None or reset is None or win not in WIN_SECONDS:
+        return None
+    total = WIN_SECONDS[win]
+    start_ts = reset.timestamp() - total
+    elapsed = (now_utc().timestamp() - start_ts) / total * 100
+    elapsed = min(max(elapsed, 0), 100)
+    diff = pct - elapsed
+    verdict = "偏快" if diff > 5 else ("偏慢" if diff < -5 else "正常")
+    return elapsed, verdict
+
+def pace_note(pct, reset, win):
+    pi = pace_info(pct, reset, win)
+    if pi is None:
+        return ""
+    return " · 时间进度%d%% %s" % (round(pi[0]), pi[1])
+
 def fmt_reset_short(cfg, ts):
     if ts is None:
         return ""
@@ -298,22 +314,6 @@ def cmd_watchdog(cfg, summary_mode):
             # everything below is skipped for relaxed accounts
             if acct in relaxed:
                 continue
-            # daily burn tracking (weekly windows)
-            if win != "5h":
-                dkey = "daystart|%s|%s" % (acct, win)
-                ds = state.get(dkey)
-                if not ds or ds.get("date") != today:
-                    ds = {"date": today, "pct": pct}
-                if pct < ds.get("pct", pct):
-                    # window refilled today; count burn from zero
-                    ds = {"date": today, "pct": 0}
-                state[dkey] = ds
-                today_used = pct - ds.get("pct", pct)
-                okey = "overspend|%s|%s|%s" % (acct, win, today)
-                if today_used >= DAILY_BUDGET * th["daily_overspend_factor"] and not state.get(okey):
-                    alerts.append("【今日超支】%s 今天已烧周额度 %.0f%%（每日预算 %.0f%%），悠着点"
-                                  % (acct, today_used, DAILY_BUDGET))
-                    state[okey] = True
             # pacing alerts (weekly windows)
             if win != "5h" and reset is not None:
                 start = reset - datetime.timedelta(days=7)
@@ -373,12 +373,7 @@ def build_summary(cfg, results, state, today):
         parts = []
         for win, (pct, reset) in q.items():
             label = "5h" if win == "5h" else "周"
-            extra = ""
-            if win != "5h" and pct is not None:
-                ds = state.get("daystart|%s|%s" % (acct, win)) or {}
-                if ds.get("date") == today:
-                    extra = " 今日%+.0f%%" % (pct - ds.get("pct", pct))
-            parts.append("%s %s%s%s" % (label, fmt_pct(pct), fmt_reset_short(cfg, reset), extra))
+            parts.append("%s %s%s%s" % (label, fmt_pct(pct), fmt_reset_short(cfg, reset), pace_note(pct, reset, win)))
         lines.append("%s: %s" % (acct, " · ".join(parts)))
     now = now_utc()
     for name, date_str in (cfg.get("plan_expiry") or {}).items():
@@ -469,14 +464,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
 def cmd_page(cfg):
     results = collect(cfg)
-    state = {}
-    if os.path.exists(cfg["state_file"]):
-        try:
-            with open(cfg["state_file"]) as f:
-                state = json.load(f)
-        except Exception:
-            pass
-    today = now_utc().astimezone(cfg["_tz"]).date().isoformat()
 
     cards = []
     for name, q in results.items():
@@ -495,13 +482,8 @@ def cmd_page(cfg):
                 if win not in q:
                     continue
                 pct, reset = q[win]
-                note = ""
-                if win == "7d" and pct is not None:
-                    ds = state.get("daystart|%s|7d" % name) or {}
-                    if ds.get("date") == today:
-                        base = ds.get("pct", pct)
-                        burn = pct - base if pct >= base else pct
-                        note = "今日已用 %+.1f%%（匀速预算 %.1f%%/天）" % (burn, DAILY_BUDGET)
+                pi = pace_info(pct, reset, win)
+                note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
                 rows.append(window_html(cfg, "5小时用量" if win == "5h" else "7天用量", pct, reset, note))
         expiry_html = ""
         exp = (cfg.get("plan_expiry") or {}).get(name)
