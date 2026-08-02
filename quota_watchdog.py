@@ -641,7 +641,15 @@ def cmd_page(cfg):
         if "error" in q:
             rows.append('<div class="err">查询失败: %s</div>' % html.escape(str(q["error"])[:80]))
         else:
-            # optional manual monthly snapshot shown on top (e.g. Kimi web-console-only quota)
+            for win in ("5h", "7d"):
+                if win not in q:
+                    continue
+                pct, reset = q[win]
+                pi = pace_info(pct, reset, win)
+                note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
+                rows.append(window_html(cfg, "5小时用量" if win == "5h" else "7天用量", pct, reset, note,
+                                         elapsed=(pi[0] if pi else None)))
+            # optional manual monthly snapshot, shown last (widest time span)
             snap = (cfg.get("monthly_snapshot") or {}).get(name)
             if snap:
                 reset_ts = parse_ts(str(snap.get("reset")) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
@@ -650,14 +658,6 @@ def cmd_page(cfg):
                 if pi:
                     note += " · 时间进度 %.0f%% · 节奏%s" % pi
                 rows.append(window_html(cfg, "月度总配额", snap.get("pct"), reset_ts, note,
-                                         elapsed=(pi[0] if pi else None)))
-            for win in ("5h", "7d"):
-                if win not in q:
-                    continue
-                pct, reset = q[win]
-                pi = pace_info(pct, reset, win)
-                note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
-                rows.append(window_html(cfg, "5小时用量" if win == "5h" else "7天用量", pct, reset, note,
                                          elapsed=(pi[0] if pi else None)))
         expiry_html = ""
         exp = (cfg.get("plan_expiry") or {}).get(name)
