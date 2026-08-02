@@ -8,18 +8,25 @@ Supported providers:
   - Kimi for Coding  (via API key -> api.kimi.com/coding/v1/usages)
 
 Subcommands:
-  watchdog            check quotas, push alerts only when rules trigger
-  watchdog --summary  always push the full daily summary (plus any alerts)
-  page                generate a static HTML dashboard
+  watchdog             check quotas, push alerts only when rules trigger
+  watchdog --summary   always push the full daily summary (plus any alerts)
+  page                 generate a static HTML dashboard
+  check-auth           optional: push when CLIProxyAPI auth-file health changes
+                        (only does anything if cliproxyapi_management_key_file is
+                        set in config; run this from its own low-frequency cron
+                        line, e.g. daily — it is not part of the hourly watchdog
+                        loop on purpose, this check doesn't need to be frequent)
 
 Python 3.8+, stdlib only. No third-party dependencies.
 """
 import argparse
+import calendar
 import datetime
 import html
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -29,6 +36,8 @@ DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
     "ntfy_url": "",                 # e.g. https://ntfy.sh/your-topic (optional)
     "cliproxyapi_auth_dir": "~/.cli-proxy-api",
+    "cliproxyapi_management_key_file": "",   # optional: enables auth-file health checks
+    "cliproxyapi_management_url": "http://127.0.0.1:8317/v0/management/auth-files",
     "accounts": [],                 # manual accounts, e.g. kimi (see config.example.json)
     "relaxed_accounts": [],         # labels that only get nearly-used-up alerts
     "plan_expiry": {},              # {"Kimi Coding": "2026-08-22"}
@@ -109,6 +118,21 @@ def fmt_pct(pct):
     return "?" if pct is None else ("%d%%" % round(pct))
 
 
+def load_state(cfg):
+    if os.path.exists(cfg["state_file"]):
+        try:
+            with open(cfg["state_file"]) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_state(cfg, state):
+    with open(cfg["state_file"], "w") as f:
+        json.dump(state, f)
+
+
 # ---------------------------------------------------------------- providers
 # each returns {"5h": (pct, reset_dt|None), "7d": (pct, reset_dt|None)}
 
@@ -171,7 +195,13 @@ def kimi_quota(api_key):
 
 
 def collect(cfg):
-    """Discover accounts and query every provider. Returns {label: windows|{"error": msg}}."""
+    """Discover accounts and query every provider. Returns {label: windows|{"error": msg}}.
+
+    For auto-discovered CLIProxyAPI accounts, label is the auth filename without
+    the ".json" suffix — this lets cmd_page match it back against the
+    management-API health check (which reports filenames) without a second
+    directory scan.
+    """
     results = {}
 
     # 1) auto-discover Claude/Codex OAuth files from the CLIProxyAPI auth dir
@@ -244,23 +274,44 @@ def push(cfg, title, body):
 
 WIN_SECONDS = {"5h": 5 * 3600, "7d": 7 * 86400}
 
-def pace_info(pct, reset, win):
-    """Compare usage pct against fair pace (elapsed time fraction of the window)."""
-    if pct is None or reset is None or win not in WIN_SECONDS:
+def _pace(pct, start, reset):
+    if pct is None or start is None or reset is None:
         return None
-    total = WIN_SECONDS[win]
-    start_ts = reset.timestamp() - total
-    elapsed = (now_utc().timestamp() - start_ts) / total * 100
+    total = (reset - start).total_seconds()
+    if total <= 0:
+        return None
+    elapsed = (now_utc().timestamp() - start.timestamp()) / total * 100
     elapsed = min(max(elapsed, 0), 100)
     diff = pct - elapsed
     verdict = "偏快" if diff > 5 else ("偏慢" if diff < -5 else "正常")
     return elapsed, verdict
+
+def pace_info(pct, reset, win):
+    """Compare usage pct against fair pace (elapsed time fraction of the window)."""
+    if win not in WIN_SECONDS or reset is None:
+        return None
+    return _pace(pct, reset - datetime.timedelta(seconds=WIN_SECONDS[win]), reset)
 
 def pace_note(pct, reset, win):
     pi = pace_info(pct, reset, win)
     if pi is None:
         return ""
     return " · 时间进度%d%% %s" % (round(pi[0]), pi[1])
+
+def month_before(dt):
+    """dt shifted back one calendar month, clamping the day for short months."""
+    y, m = dt.year, dt.month - 1
+    if m == 0:
+        m, y = 12, y - 1
+    day = min(dt.day, calendar.monthrange(y, m)[1])
+    return dt.replace(year=y, month=m, day=day)
+
+def monthly_pace(pct, reset):
+    """Same as pace_info but for a manually-snapshotted monthly quota, whose
+    window is defined as "one calendar month ending at reset"."""
+    if reset is None:
+        return None
+    return _pace(pct, month_before(reset), reset)
 
 def fmt_reset_short(cfg, ts):
     if ts is None:
@@ -273,14 +324,7 @@ def cmd_watchdog(cfg, summary_mode):
     th = cfg["thresholds"]
     results = collect(cfg)
 
-    state = {}
-    if os.path.exists(cfg["state_file"]):
-        try:
-            with open(cfg["state_file"]) as f:
-                state = json.load(f)
-        except Exception:
-            state = {}
-
+    state = load_state(cfg)
     alerts = []
     now = now_utc()
     today = now.astimezone(cfg["_tz"]).date().isoformat()
@@ -358,8 +402,7 @@ def cmd_watchdog(cfg, summary_mode):
                 state[ekey] = True
                 break
 
-    with open(cfg["state_file"], "w") as f:
-        json.dump(state, f)
+    save_state(cfg, state)
 
     summary = build_summary(cfg, results, state, today)
     log(cfg, "summary: " + summary.replace("\n", " | "))
@@ -387,6 +430,60 @@ def build_summary(cfg, results, state, today):
             days_left = (exp.date() - now.astimezone(cfg["_tz"]).date()).days
             lines.append("%s 套餐: %d 天后到期（%s）" % (name, max(days_left, 0), date_str))
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- auth health (optional)
+
+def auth_health_map(cfg):
+    """Query CLIProxyAPI's own local management API for auth-file health.
+
+    Optional feature: returns None (meaning "not configured / unavailable") unless
+    cliproxyapi_management_key_file is set. Users who don't run CLIProxyAPI, or
+    don't want this dependency, simply never set that config key and every call
+    site here degrades to "no health info" instead of failing.
+    """
+    key_file = cfg.get("cliproxyapi_management_key_file")
+    if not key_file:
+        return None
+    try:
+        mk = open(os.path.expanduser(key_file)).read().strip()
+        url = cfg.get("cliproxyapi_management_url") or DEFAULTS["cliproxyapi_management_url"]
+        r = http_get(url, {"Authorization": "Bearer " + mk})
+    except Exception as e:
+        log(cfg, "auth health check failed: " + str(e))
+        return None
+    bad = set()
+    for f in r.get("files") or []:
+        if f.get("disabled"):
+            continue
+        if f.get("status") == "error" or f.get("unavailable"):
+            bad.add(f.get("name"))
+    return bad
+
+
+def cmd_check_auth(cfg):
+    """Push only when the set of unhealthy auth files changes since last run.
+    Meant to run on its own low-frequency cron line (daily is plenty) — this is
+    deliberately NOT wired into the hourly cmd_watchdog loop."""
+    bad_set = auth_health_map(cfg)
+    if bad_set is None:
+        log(cfg, "check-auth skipped: cliproxyapi_management_key_file not configured, "
+                  "or the check itself failed (see previous log line)")
+        return
+    current_key = ",".join(sorted(bad_set)) if bad_set else "NONE"
+
+    state = load_state(cfg)
+    prev_key = state.get("auth_health_prev", "NONE")
+    if current_key == prev_key:
+        return
+    state["auth_health_prev"] = current_key
+    save_state(cfg, state)
+
+    if current_key == "NONE":
+        push(cfg, "CPA 账号恢复正常", "所有账号已恢复 active")
+    else:
+        push(cfg, "CPA 账号异常", " ".join(sorted(bad_set)))
+    log(cfg, "auth health changed: " + current_key)
 
 
 # ---------------------------------------------------------------- page
@@ -418,41 +515,57 @@ def bar_color(pct):
     return "#3fb950"
 
 
-def window_html(cfg, label, pct, reset, note=""):
+def window_html(cfg, label, pct, reset, note="", elapsed=None):
     pct_txt = "未知" if pct is None else ("%.2f%%" % pct if pct < 10 else "%.1f%%" % pct)
     width = 0 if pct is None else max(min(pct, 100), 0.5)
+    marker_html = ""
+    if elapsed is not None:
+        marker_html = '<div class="time-marker" style="left:%.1f%%"></div>' % max(min(elapsed, 100), 0)
     note_html = '<div class="note">%s</div>' % html.escape(note) if note else ""
     return """
     <div class="win">
       <div class="win-head"><span>%s</span><span class="pct" style="color:%s">%s</span></div>
-      <div class="bar"><div class="fill" style="width:%.1f%%;background:%s"></div></div>
+      <div class="bar"><div class="fill" style="width:%.1f%%;background:%s"></div>%s</div>
       <div class="reset">%s</div>
       %s
-    </div>""" % (html.escape(label), bar_color(pct), pct_txt, width, bar_color(pct),
+    </div>""" % (html.escape(label), bar_color(pct), pct_txt, width, bar_color(pct), marker_html,
                  html.escape(fmt_reset_page(cfg, reset)), note_html)
 
+
+BADGE = {
+    "ok": ("🟢", "正常"),
+    "token_expired": ("🔴", "Token 异常"),
+    "error": ("🟡", "查询异常"),
+}
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="900">
 <title>额度监控</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d1117; color: #e6edf3; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 16px; max-width: 720px; margin: 0 auto; }
   h1 { font-size: 20px; margin-bottom: 4px; }
-  .updated { color: #7d8590; font-size: 12px; margin-bottom: 16px; }
+  .updated { color: #7d8590; font-size: 12px; margin-bottom: 10px; }
+  .banner { font-size: 13px; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; background: #161b22; border: 1px solid #30363d; color: #3fb950; }
+  .banner.bad { color: #e5534b; border-color: #e5534b; }
+  .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; font-size: 13px; }
+  .btn, .mini-btn { display: inline-block; background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; text-decoration: none; font-size: 12px; }
+  .btn:hover, .mini-btn:hover { background: #30363d; }
+  .controls select { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 3px 6px; font-size: 12px; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
-  .card h2 { font-size: 16px; margin-bottom: 12px; }
-  .card h2 .plan { color: #7d8590; font-size: 12px; font-weight: normal; margin-left: 6px; }
+  .card h2 { font-size: 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+  .card-actions { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: normal; }
+  .badge { color: #7d8590; }
   .win { margin-bottom: 14px; }
   .win:last-child { margin-bottom: 0; }
   .win-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
   .pct { font-weight: 600; }
-  .bar { background: #30363d; border-radius: 6px; height: 10px; overflow: hidden; }
+  .bar { position: relative; background: #30363d; border-radius: 6px; height: 10px; overflow: hidden; }
   .fill { height: 100%; border-radius: 6px; transition: width .3s; }
+  .time-marker { position: absolute; top: 0; bottom: 0; width: 2px; background: #e6edf3; opacity: .85; }
   .reset { color: #7d8590; font-size: 12px; margin-top: 5px; }
   .note { color: #7d8590; font-size: 11px; margin-top: 3px; font-style: italic; }
   .err { color: #e5534b; font-size: 13px; }
@@ -462,16 +575,68 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <h1>📊 大模型额度监控</h1>
 <div class="updated">数据更新于 @UPDATED@ · llm-quota-watchdog</div>
+@BANNER@
+<div class="controls">
+  <a class="btn" href="/refresh">🔄 全部刷新</a>
+  <label>自动刷新
+    <select id="auto-refresh" onchange="setAutoRefresh(this.value)">
+      <option value="0">关闭</option>
+      <option value="300">5分钟</option>
+      <option value="900">15分钟</option>
+      <option value="1800">30分钟</option>
+      <option value="3600">1小时</option>
+      <option value="10800">3小时</option>
+    </select>
+  </label>
+</div>
 @CARDS@
+<script>
+(function(){
+  var sel = document.getElementById('auto-refresh');
+  var saved = localStorage.getItem('quotaAutoRefresh') || '0';
+  sel.value = saved;
+  arm(saved);
+  function arm(v){
+    v = parseInt(v, 10) || 0;
+    if (v > 0) setTimeout(function(){ location.href = '/refresh'; }, v * 1000);
+  }
+  window.setAutoRefresh = function(v){
+    localStorage.setItem('quotaAutoRefresh', v);
+    arm(v);
+  };
+})();
+</script>
 </body>
 </html>"""
+# NOTE: "全部刷新" / per-card refresh links and the auto-refresh dropdown are
+# pure frontend — they just navigate to /refresh (optionally ?account=<label>).
+# This script does not ship a server for that endpoint; if you don't run one,
+# the buttons simply 404 and the static page itself is unaffected. See the
+# README for a minimal example of such a refresh trigger.
 
 
 def cmd_page(cfg):
     results = collect(cfg)
+    bad_set = auth_health_map(cfg)
 
     cards = []
+    unhealthy = []
+    healthy = 0
     for name, q in results.items():
+        if bad_set is not None and (name + ".json") in bad_set:
+            health = "token_expired"
+        elif "error" in q:
+            health = "error"
+        elif bad_set is None:
+            health = None
+        else:
+            health = "ok"
+        if health is not None:
+            if health == "ok":
+                healthy += 1
+            else:
+                unhealthy.append(name)
+
         rows = []
         if "error" in q:
             rows.append('<div class="err">查询失败: %s</div>' % html.escape(str(q["error"])[:80]))
@@ -479,17 +644,21 @@ def cmd_page(cfg):
             # optional manual monthly snapshot shown on top (e.g. Kimi web-console-only quota)
             snap = (cfg.get("monthly_snapshot") or {}).get(name)
             if snap:
-                rows.append(window_html(
-                    cfg, "月度总配额", snap.get("pct"),
-                    parse_ts(str(snap.get("reset")) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"]),
-                    "手动更新于 %s" % snap.get("updated", "?")))
+                reset_ts = parse_ts(str(snap.get("reset")) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
+                pi = monthly_pace(snap.get("pct"), reset_ts)
+                note = "手动更新于 %s" % snap.get("updated", "?")
+                if pi:
+                    note += " · 时间进度 %.0f%% · 节奏%s" % pi
+                rows.append(window_html(cfg, "月度总配额", snap.get("pct"), reset_ts, note,
+                                         elapsed=(pi[0] if pi else None)))
             for win in ("5h", "7d"):
                 if win not in q:
                     continue
                 pct, reset = q[win]
                 pi = pace_info(pct, reset, win)
                 note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
-                rows.append(window_html(cfg, "5小时用量" if win == "5h" else "7天用量", pct, reset, note))
+                rows.append(window_html(cfg, "5小时用量" if win == "5h" else "7天用量", pct, reset, note,
+                                         elapsed=(pi[0] if pi else None)))
         expiry_html = ""
         exp = (cfg.get("plan_expiry") or {}).get(name)
         if exp:
@@ -497,12 +666,29 @@ def cmd_page(cfg):
             if exp_ts:
                 days = (exp_ts.date() - now_utc().astimezone(cfg["_tz"]).date()).days
                 expiry_html = '<div class="expiry">📅 套餐周期 %d 天后重置（%s）</div>' % (max(days, 0), exp)
-        cards.append('<div class="card"><h2>%s</h2>%s%s</div>' % (html.escape(name), "".join(rows), expiry_html))
+
+        badge_html = ""
+        if health is not None:
+            dot, htext = BADGE[health]
+            badge_html = '<span class="badge">%s %s</span>' % (dot, html.escape(htext))
+        refresh_link = "/refresh?account=" + urllib.parse.quote(name)
+        cards.append(
+            '<div class="card"><h2><span>%s</span><span class="card-actions">%s'
+            '<a class="mini-btn" href="%s">刷新</a></span></h2>%s%s</div>'
+            % (html.escape(name), badge_html, refresh_link, "".join(rows), expiry_html))
+
+    if unhealthy:
+        banner_html = '<div class="banner bad">⚠️ %s 异常，其余正常</div>' % html.escape("、".join(unhealthy))
+    elif bad_set is not None:
+        banner_html = '<div class="banner">✅ %d/%d 账号正常</div>' % (healthy, len(results))
+    else:
+        banner_html = ""
 
     out_dir = cfg["page_out_dir"]
     os.makedirs(out_dir, exist_ok=True)
     page = (PAGE_TEMPLATE
             .replace("@UPDATED@", now_utc().astimezone(cfg["_tz"]).strftime("%m月%d日 %H:%M"))
+            .replace("@BANNER@", banner_html)
             .replace("@CARDS@", "".join(cards)))
     tmp = os.path.join(out_dir, ".index.html.tmp")
     with open(tmp, "w") as f:
@@ -515,7 +701,7 @@ def cmd_page(cfg):
 
 def main():
     ap = argparse.ArgumentParser(description="llm-quota-watchdog: LLM coding-plan quota dashboard + alerts")
-    ap.add_argument("command", choices=["watchdog", "page"])
+    ap.add_argument("command", choices=["watchdog", "page", "check-auth"])
     ap.add_argument("--summary", action="store_true", help="watchdog: always push the full summary")
     ap.add_argument("--config", default=os.environ.get("QUOTA_WATCHDOG_CONFIG", "./config.json"))
     ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
@@ -524,8 +710,10 @@ def main():
     cfg = load_config(os.path.expanduser(args.config))
     if args.command == "watchdog":
         cmd_watchdog(cfg, args.summary)
-    else:
+    elif args.command == "page":
         cmd_page(cfg)
+    else:
+        cmd_check_auth(cfg)
 
 
 if __name__ == "__main__":

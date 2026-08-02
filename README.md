@@ -23,7 +23,9 @@ llm-quota-watchdog polls the same endpoints the official CLIs use, renders a sin
 
 ### Dashboard (static HTML, regenerate on cron)
 
-Per account: 5-hour / weekly progress bars with exact percentages, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. Dark, mobile-friendly.
+Per account: 5-hour / weekly / monthly (manual snapshot) progress bars with exact percentages, a time-progress marker on each bar, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. Dark, mobile-friendly.
+
+The page also has a "refresh all" button, a per-account refresh link, and an auto-refresh interval dropdown. These are plain links to `/refresh` (optionally `?account=<label>`) — this repo doesn't ship a server for that endpoint, so if you don't wire one up the buttons just 404 and the static page itself is unaffected. See [Optional: on-demand refresh](#optional-on-demand-refresh) below for a minimal example.
 
 ![dashboard](docs/screenshot.png)
 
@@ -41,6 +43,17 @@ Per account: 5-hour / weekly progress bars with exact percentages, reset countdo
 
 Every alert fires **once per window per cycle** (state-file dedup) — no spam.
 Accounts on a big plan you don't want to be nagged about can be listed in `relaxed_accounts` (they keep only the "nearly used up" alert).
+
+### Optional: CLIProxyAPI auth-file health check
+
+If you run [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), set `cliproxyapi_management_key_file` in config to point at a file with its management-API key. This unlocks:
+
+- a 🟢/🔴/🟡 health badge on each dashboard card (plus a summary banner when something's off), sourced from CLIProxyAPI's own local management API — not from a failed quota request, so it's accurate even before the upstream quota call would notice
+- the `check-auth` subcommand, which pushes a Bark/ntfy alert only when the set of unhealthy auth files *changes* (token expired → alert; recovers → alert; otherwise silent)
+
+This check is a **local** call (`http://127.0.0.1:8317/...` by default) — it isn't subject to the "don't hammer the upstream API" concern the polling frequency below is about. Even so, `check-auth` is meant to run from its own **low-frequency** cron line (daily is plenty for "did my token expire") — it's deliberately not folded into the hourly `watchdog` loop, since a token that's still expired an hour later doesn't need a second alert.
+
+If you don't set `cliproxyapi_management_key_file`, none of this activates: no badges, no banner, `check-auth` is a silent no-op. Fully optional.
 
 ## Data sources
 
@@ -68,6 +81,12 @@ The installer downloads the script, creates `~/.local/share/llm-quota-watchdog/c
 47 * * * *  watchdog            # hourly silent check, pushes only when a rule fires
  5 9 * * *  watchdog --summary  # daily full report at 09:05 server local time
 12 * * * *  page                # hourly static page regeneration
+```
+
+If you configured `cliproxyapi_management_key_file`, add the optional daily health check too (see [above](#optional-cliproxyapi-auth-file-health-check) for why this is a separate, low-frequency line rather than part of `watchdog`):
+
+```
+0 18 * * *  check-auth          # once a day is enough — pushes only on change
 ```
 
 Test it:
@@ -112,6 +131,40 @@ See [config.example.json](config.example.json) — every key has a sane default.
 | `monthly_snapshot` | manually-maintained monthly quota shown on the page |
 | `thresholds` | every alert threshold is tunable |
 | `timezone_offset_hours` | display/report timezone (default UTC+8) |
+| `cliproxyapi_management_key_file` | optional; enables auth-file health badges + `check-auth` (see above) |
+| `cliproxyapi_management_url` | CLIProxyAPI management API URL, default `http://127.0.0.1:8317/v0/management/auth-files` |
+
+## Optional: on-demand refresh
+
+The dashboard's refresh buttons just link to `/refresh` / `/refresh?account=<label>` — wire up whatever you like behind that path. A minimal example: a tiny local HTTP server that reruns `page` (optionally scoped to one account) and 302s back, proxied through your existing web server under the same auth so the endpoint isn't public:
+
+```python
+# refresh_server.py — listens on 127.0.0.1 only
+import http.server, socketserver, subprocess, urllib.parse
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        account = (qs.get("account") or [None])[0]
+        cmd = ["llm-quota-watchdog", "page"]
+        subprocess.run(cmd, timeout=60)  # page always regenerates every account currently in state
+        self.send_response(302); self.send_header("Location", "/"); self.end_headers()
+
+with socketserver.ThreadingTCPServer(("127.0.0.1", 8791), Handler) as httpd:
+    httpd.serve_forever()
+```
+
+nginx in front of it:
+
+```nginx
+location = /refresh {
+    auth_basic "quota";
+    auth_basic_user_file /etc/nginx/.htpasswd-quota;
+    proxy_pass http://127.0.0.1:8791/refresh;
+}
+```
+
+Add your own debounce (e.g. skip re-running if the last run was <20s ago) if the page might get multiple clicks in a row.
 
 ## FAQ
 

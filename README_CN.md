@@ -23,7 +23,9 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 
 ### 额度仪表盘（静态 HTML，cron 定时生成）
 
-每个账号：5 小时 / 每周进度条、精确百分比、重置倒计时、用量 vs 时间节奏（偏快/偏慢）、套餐到期倒计时。深色主题，手机友好。
+每个账号：5 小时 / 每周 / 月度（手动快照）进度条、精确百分比、柱状图上的时间进度刻度线、重置倒计时、用量 vs 时间节奏（偏快/偏慢）、套餐到期倒计时。深色主题，手机友好。
+
+页面上还有"全部刷新"按钮、每张卡片自己的刷新链接、以及自动刷新间隔下拉框。这些都是纯前端链接，指向 `/refresh`（可带 `?account=<label>`）——本仓库不附带这个端点的服务端实现，不接的话按钮点了就是 404，不影响页面本身。想接的话见下文[「可选：按需刷新」](#可选按需刷新)。
 
 ![dashboard](docs/screenshot.png)
 
@@ -41,6 +43,17 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 
 每条告警**一个周期只推一次**（状态文件去重），不刷屏。
 大套餐不想被念叨的账号可以放进 `relaxed_accounts`，只保留"快用完"。
+
+### 可选：CLIProxyAPI 认证文件健康检测
+
+如果你在用 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)，在配置里设置 `cliproxyapi_management_key_file` 指向一个存有管理 API key 的文件，就能解锁：
+
+- 每张卡片上的 🟢/🔴/🟡 健康徽章（异常时页面顶部还会多一条汇总横幅），信号来自 CLIProxyAPI 自己的本地管理 API，而不是"额度请求失败就猜 token 坏了"——更准确，且额度请求本身还没报错之前就能发现
+- `check-auth` 子命令：只有异常账号集合**发生变化**时才推送（token 过期→推一次；恢复→再推一次；其余时候静默）
+
+这是一次**本地调用**（默认 `http://127.0.0.1:8317/...`），不受下面轮询频率那条"别对上游 API 太频繁"的顾虑影响。不过 `check-auth` 仍然建议放在自己独立的**低频** cron 行里（一天一次足够判断"token 是不是又过期了"）——刻意没有并进每小时的 `watchdog` 循环，因为 token 过期一小时后还是过期，没必要重复提醒。
+
+不配置 `cliproxyapi_management_key_file` 的话，这一整块都不会生效：没有徽章、没有横幅，`check-auth` 静默跳过。完全可选。
 
 ## 数据来源
 
@@ -68,6 +81,12 @@ curl -fsSL https://raw.githubusercontent.com/toolazytoname/llm-quota-watchdog/ma
 47 * * * *  watchdog            # 每小时静默检查，只在触发规则时推送
  5 9 * * *  watchdog --summary  # 每天 9:05（服务器本地时间）推全量报告
 12 * * * *  page                # 每小时重新生成静态页面
+```
+
+如果配置了 `cliproxyapi_management_key_file`，再加一条可选的每日健康检测（为什么单独一条低频的、不并进 `watchdog`，见上文"可选：CLIProxyAPI 认证文件健康检测"一节）：
+
+```
+0 18 * * *  check-auth          # 一天一次就够，状态不变不推送
 ```
 
 测试：
@@ -103,6 +122,40 @@ location /quota/ {
 | `monthly_snapshot` | 手动维护的月度配额快照，显示在页面上 |
 | `thresholds` | 所有告警阈值都可调 |
 | `timezone_offset_hours` | 显示/报告时区（默认 UTC+8） |
+| `cliproxyapi_management_key_file` | 可选，配置后解锁认证文件健康徽章 + `check-auth`（见上文） |
+| `cliproxyapi_management_url` | CLIProxyAPI 管理 API 地址，默认 `http://127.0.0.1:8317/v0/management/auth-files` |
+
+## 可选：按需刷新
+
+页面上的刷新按钮只是指向 `/refresh` / `/refresh?account=<label>` 的链接，具体接什么服务端自己定。给个最小示例：一个只监听本地的小 HTTP 服务，收到请求就重新跑一遍 `page`（可选只刷某个账号），跑完 302 跳回首页，套一层跟主站相同的 basic auth 反代出去，不裸露公网：
+
+```python
+# refresh_server.py —— 只监听 127.0.0.1
+import http.server, socketserver, subprocess, urllib.parse
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        account = (qs.get("account") or [None])[0]
+        cmd = ["llm-quota-watchdog", "page"]
+        subprocess.run(cmd, timeout=60)  # page 目前是整体重新生成
+        self.send_response(302); self.send_header("Location", "/"); self.end_headers()
+
+with socketserver.ThreadingTCPServer(("127.0.0.1", 8791), Handler) as httpd:
+    httpd.serve_forever()
+```
+
+nginx 反代：
+
+```nginx
+location = /refresh {
+    auth_basic "quota";
+    auth_basic_user_file /etc/nginx/.htpasswd-quota;
+    proxy_pass http://127.0.0.1:8791/refresh;
+}
+```
+
+如果担心页面被连续点击触发重复请求，自己加个去抖（比如上次运行 <20 秒内直接跳过）。
 
 ## 常见问题
 

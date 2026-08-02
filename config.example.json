@@ -2,6 +2,8 @@
   "bark_url": "https://api.day.app/YOUR_BARK_KEY/",
   "ntfy_url": "",
   "cliproxyapi_auth_dir": "~/.cli-proxy-api",
+  "cliproxyapi_management_key_file": "",
+  "cliproxyapi_management_url": "http://127.0.0.1:8317/v0/management/auth-files",
   "accounts": [
     {
       "type": "kimi",
