@@ -574,10 +574,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>📊 大模型额度监控</h1>
-<div class="updated">数据更新于 @UPDATED@ · llm-quota-watchdog</div>
-@BANNER@
+<div class="updated" id="updated">数据更新于 @UPDATED@ · llm-quota-watchdog</div>
+<div id="banner-wrap">@BANNER@</div>
 <div class="controls">
-  <a class="btn" href="/refresh">🔄 全部刷新</a>
+  <a class="btn refresh-link" href="/refresh">🔄 全部刷新</a>
   <label>自动刷新
     <select id="auto-refresh" onchange="setAutoRefresh(this.value)">
       <option value="0">关闭</option>
@@ -589,17 +589,63 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     </select>
   </label>
 </div>
-@CARDS@
+<div id="cards">@CARDS@</div>
 <script>
 (function(){
   var sel = document.getElementById('auto-refresh');
   var saved = localStorage.getItem('quotaAutoRefresh') || '0';
   sel.value = saved;
-  arm(saved);
-  function arm(v){
-    v = parseInt(v, 10) || 0;
-    if (v > 0) setTimeout(function(){ location.href = '/refresh'; }, v * 1000);
+  var timer = null;
+
+  function patchFromHtml(htmlText, account){
+    var doc = new DOMParser().parseFromString(htmlText, 'text/html');
+    var upd = doc.getElementById('updated');
+    var ban = doc.getElementById('banner-wrap');
+    if (upd) document.getElementById('updated').innerHTML = upd.innerHTML;
+    if (ban) document.getElementById('banner-wrap').innerHTML = ban.innerHTML;
+    if (account) {
+      var sel2 = '[data-account="' + CSS.escape(account) + '"]';
+      var newCard = doc.querySelector(sel2);
+      var oldCard = document.querySelector(sel2);
+      if (newCard && oldCard) oldCard.outerHTML = newCard.outerHTML;
+    } else {
+      var newCards = doc.getElementById('cards');
+      var oldCards = document.getElementById('cards');
+      if (newCards && oldCards) oldCards.innerHTML = newCards.innerHTML;
+    }
   }
+
+  function doRefresh(url, account){
+    return fetch(url, {credentials: 'same-origin'})
+      .then(function(r){ return r.text(); })
+      .then(function(text){ patchFromHtml(text, account); })
+      .catch(function(){ location.href = url; });
+  }
+
+  document.addEventListener('click', function(e){
+    var el = e.target.closest && e.target.closest('.refresh-link');
+    if (!el) return;
+    e.preventDefault();
+    if (el.dataset.busy) return;
+    el.dataset.busy = '1';
+    var prevText = el.textContent;
+    el.textContent = '刷新中…';
+    doRefresh(el.getAttribute('href'), el.dataset.account || null).finally(function(){
+      if (document.body.contains(el)) { el.textContent = prevText; delete el.dataset.busy; }
+    });
+  });
+
+  function arm(v){
+    if (timer) clearTimeout(timer);
+    v = parseInt(v, 10) || 0;
+    if (v > 0) {
+      timer = setTimeout(function(){
+        doRefresh('/refresh', null).then(function(){ arm(v); });
+      }, v * 1000);
+    }
+  }
+  arm(saved);
+
   window.setAutoRefresh = function(v){
     localStorage.setItem('quotaAutoRefresh', v);
     arm(v);
@@ -609,7 +655,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 # NOTE: "全部刷新" / per-card refresh links and the auto-refresh dropdown are
-# pure frontend — they just navigate to /refresh (optionally ?account=<label>).
+# pure frontend — they just fetch() /refresh (optionally ?account=<label>) and
+# patch the DOM in place (falling back to a full navigation if fetch fails).
 # This script does not ship a server for that endpoint; if you don't run one,
 # the buttons simply 404 and the static page itself is unaffected. See the
 # README for a minimal example of such a refresh trigger.
@@ -672,10 +719,11 @@ def cmd_page(cfg):
             dot, htext = BADGE[health]
             badge_html = '<span class="badge">%s %s</span>' % (dot, html.escape(htext))
         refresh_link = "/refresh?account=" + urllib.parse.quote(name)
+        name_esc = html.escape(name)
         cards.append(
-            '<div class="card"><h2><span>%s</span><span class="card-actions">%s'
-            '<a class="mini-btn" href="%s">刷新</a></span></h2>%s%s</div>'
-            % (html.escape(name), badge_html, refresh_link, "".join(rows), expiry_html))
+            '<div class="card" data-account="%s"><h2><span>%s</span><span class="card-actions">%s'
+            '<a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a></span></h2>%s%s</div>'
+            % (name_esc, name_esc, badge_html, refresh_link, name_esc, "".join(rows), expiry_html))
 
     if unhealthy:
         banner_html = '<div class="banner bad">⚠️ %s 异常，其余正常</div>' % html.escape("、".join(unhealthy))
