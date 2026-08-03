@@ -9,6 +9,11 @@
       "type": "kimi",
       "label": "Kimi Coding",
       "api_key_file": "~/.config/llm-quota-watchdog/kimi-key"
+    },
+    {
+      "type": "glm",
+      "label": "GLM Coding",
+      "api_key_file": "~/.config/llm-quota-watchdog/glm-key"
     }
   ],
   "relaxed_accounts": [],

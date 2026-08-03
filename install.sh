@@ -40,6 +40,12 @@ EOF
     chmod 600 "$HOME/.config/llm-quota-watchdog/kimi-key"
   fi
 
+  read -rp "GLM Coding Plan API key (id.secret, empty to skip): " GLM
+  if [ -n "$GLM" ]; then
+    echo "$GLM" > "$HOME/.config/llm-quota-watchdog/glm-key"
+    chmod 600 "$HOME/.config/llm-quota-watchdog/glm-key"
+  fi
+
   read -rp "CLIProxyAPI auth dir [~/.cli-proxy-api]: " AUTHDIR
   if [ -n "$AUTHDIR" ]; then
     python3 - "$INSTALL_DIR/config.json" "$AUTHDIR" <<'EOF'

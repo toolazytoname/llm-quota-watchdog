@@ -6,6 +6,7 @@ Supported providers:
   - Claude Pro/Max   (via CLIProxyAPI OAuth auth file -> api.anthropic.com/api/oauth/usage)
   - Codex Plus/Pro   (via CLIProxyAPI OAuth auth file -> chatgpt.com/backend-api/wham/usage)
   - Kimi for Coding  (via API key -> api.kimi.com/coding/v1/usages)
+  - GLM Coding Plan  (via API key -> open.bigmodel.cn/api/monitor/usage/quota/limit)
 
 Subcommands:
   watchdog             check quotas, push alerts only when rules trigger
@@ -194,6 +195,61 @@ def kimi_quota(api_key):
     return out
 
 
+def glm_quota(api_key):
+    """GLM Coding Plan (Zhipu). The Authorization header carries the API key
+    directly — NO "Bearer " prefix, unlike Claude/Codex. Response data.limits[]
+    has one entry per window; each window's reset is a millisecond epoch in
+    nextResetTime. Windows are classified by time-to-reset (same heuristic as
+    codex_quota) because the type/unit/number codes are undocumented and vary
+    by plan, and 'percentage' is an integer we recompute from used/total for
+    sub-integer precision.
+    """
+    r = http_get("https://open.bigmodel.cn/api/monitor/usage/quota/limit", {
+        "Authorization": api_key,
+        "Accept-Language": "en-US,en",
+        "Content-Type": "application/json",
+    })
+    out = {}
+    now = now_utc()
+    for item in ((r.get("data") or {}).get("limits") or []):
+        if not isinstance(item, dict):
+            continue
+        reset = None
+        reset_ms = item.get("nextResetTime")
+        if isinstance(reset_ms, (int, float)) and reset_ms > 0:
+            reset = datetime.datetime.fromtimestamp(reset_ms / 1000, tz=datetime.timezone.utc)
+        # 'usage' is confusingly the total quota; 'currentValue' is used
+        pct = None
+        try:
+            total = float(item.get("usage") or 0)
+            if total > 0:
+                pct = float(item.get("currentValue") or 0) / total * 100
+        except (TypeError, ValueError):
+            pct = None
+        if pct is None and item.get("percentage") is not None:
+            try:
+                pct = float(item["percentage"])
+            except (TypeError, ValueError):
+                pass
+        if pct is None:
+            continue
+        # classify by time-to-reset: <6h -> 5h window, <8d -> weekly;
+        # anything longer (e.g. a ~30d MCP/monthly window) is not modeled here
+        if reset is not None:
+            hrs = (reset - now).total_seconds() / 3600
+            if hrs < 6:
+                label = "5h"
+            elif hrs < 192:
+                label = "7d"
+            else:
+                continue
+        else:
+            label = "5h" if item.get("unit") == 3 else "7d"
+        if label not in out:
+            out[label] = (pct, reset)
+    return out
+
+
 def collect(cfg):
     """Discover accounts and query every provider. Returns {label: windows|{"error": msg}}.
 
@@ -227,13 +283,17 @@ def collect(cfg):
         label = acc.get("label") or acc.get("type", "?")
         try:
             t = acc.get("type")
-            if t == "kimi":
+            if t in ("kimi", "glm"):
                 key = acc.get("api_key") or ""
                 if not key and acc.get("api_key_file"):
-                    with open(os.path.expanduser(acc["api_key_file"])) as f:
-                        key = f.read().strip()
-                if key:
-                    results[label] = kimi_quota(key)
+                    kf = os.path.expanduser(acc["api_key_file"])
+                    if os.path.exists(kf):
+                        with open(kf) as f:
+                            key = f.read().strip()
+                if not key:
+                    continue  # no key configured -> skip silently (no error card)
+                fn = kimi_quota if t == "kimi" else glm_quota
+                results[label] = fn(key)
             elif t in ("claude", "codex") and acc.get("auth_file"):
                 fn = claude_quota if t == "claude" else codex_quota
                 results[label] = fn(os.path.expanduser(acc["auth_file"]))

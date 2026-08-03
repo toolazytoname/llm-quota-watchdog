@@ -1,7 +1,7 @@
 # llm-quota-watchdog
 
 **One dashboard + smart push alerts for all your LLM coding-plan quotas.**
-Claude Pro/Max · Codex Plus/Pro · Kimi for Coding
+Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan
 
 [中文文档](README_CN.md)
 
@@ -11,7 +11,7 @@ Python 3.8+, **stdlib only, zero dependencies**. Static HTML output, no database
 
 ## Why
 
-Subscription coding plans (Claude Pro/Max, ChatGPT Codex, Kimi for Coding) all have **5-hour and weekly quota windows**, but:
+Subscription coding plans (Claude Pro/Max, ChatGPT Codex, Kimi for Coding, Zhipu GLM Coding Plan) all have **5-hour and weekly quota windows**, but:
 
 - none of them has a "remaining quota" page you can check in one place,
 - relay panels (new-api, CPA-Manager-Plus, …) only show relay-side traffic, not the upstream subscription windows,
@@ -64,6 +64,7 @@ The tool calls the exact endpoints the official CLIs use:
 | Claude | `api.anthropic.com/api/oauth/usage` | OAuth token from CLIProxyAPI auth file (auto-discovered) |
 | Codex | `chatgpt.com/backend-api/wham/usage` | OAuth token + account id from CLIProxyAPI auth file (auto-discovered) |
 | Kimi for Coding | `api.kimi.com/coding/v1/usages` | your coding-plan API key (`sk-...`, from the kimi.com console) |
+| GLM Coding Plan | `open.bigmodel.cn/api/monitor/usage/quota/limit` | your Zhipu API key (passed in the `Authorization` header directly, **no Bearer prefix**) |
 
 If you run [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), just point `cliproxyapi_auth_dir` at its auth dir — every Claude/Codex account is picked up automatically, no extra config.
 
@@ -125,7 +126,7 @@ See [config.example.json](config.example.json) — every key has a sane default.
 |---|---|
 | `bark_url` / `ntfy_url` | push channel(s); either, both, or none |
 | `cliproxyapi_auth_dir` | directory with CLIProxyAPI OAuth `*.json` files; Claude/Codex auto-discovered |
-| `accounts` | manual accounts, e.g. Kimi (`api_key` or `api_key_file`), or explicitly-labelled Claude/Codex |
+| `accounts` | manual accounts, e.g. Kimi / GLM (`api_key` or `api_key_file`), or explicitly-labelled Claude/Codex |
 | `relaxed_accounts` | labels that only get the "nearly used up" alert |
 | `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → countdown on page + expiry alerts |
 | `monthly_snapshot` | manually-maintained monthly quota shown on the page |
@@ -184,7 +185,7 @@ Make sure your Bark/ntfy URL is reachable from the host (`curl` it). Bark keys r
 
 - All credentials stay on your machine: OAuth files are read in place; the Kimi key lives in a `chmod 600` file.
 - `config.json` may contain secrets — it is gitignored; never commit it.
-- The tool makes outbound calls only to the three official endpoints plus your push channel.
+- The tool makes outbound calls only to each provider's official usage endpoint plus your push channel.
 
 ## Roadmap / contributing
 

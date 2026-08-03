@@ -1,7 +1,7 @@
 # llm-quota-watchdog
 
 **一个页面 + 智能推送，看住你所有大模型编程套餐的额度。**
-支持 Claude Pro/Max · Codex Plus/Pro · Kimi for Coding
+支持 Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan
 
 [English](README.md)
 
@@ -11,7 +11,7 @@ Python 3.8+，**只用标准库，零依赖**。输出静态 HTML，无数据库
 
 ## 为什么做这个
 
-订阅制编程套餐（Claude Pro/Max、ChatGPT Codex、Kimi for Coding）都有 **5 小时和每周两套额度窗口**，但是：
+订阅制编程套餐（Claude Pro/Max、ChatGPT Codex、Kimi for Coding、智谱 GLM Coding Plan）都有 **5 小时和每周两套额度窗口**，但是：
 
 - 没有任何一个地方能统一查看各家的剩余额度；
 - 中转站面板（new-api、CPA-Manager-Plus 等）只能看到中转站侧的流量，看不到上游订阅的真实窗口；
@@ -64,6 +64,7 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 | Claude | `api.anthropic.com/api/oauth/usage` | CLIProxyAPI 认证文件里的 OAuth token（自动发现） |
 | Codex | `chatgpt.com/backend-api/wham/usage` | CLIProxyAPI 认证文件里的 OAuth token + account id（自动发现） |
 | Kimi for Coding | `api.kimi.com/coding/v1/usages` | 你的 coding 套餐 API key（kimi.com 控制台生成） |
+| GLM Coding Plan | `open.bigmodel.cn/api/monitor/usage/quota/limit` | 你的智谱 API key（Authorization 头直接放，**不带 Bearer**） |
 
 如果你在用 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)，把 `cliproxyapi_auth_dir` 指向它的认证目录即可，所有 Claude/Codex 账号自动接入，零配置。
 
@@ -116,7 +117,7 @@ location /quota/ {
 |---|---|
 | `bark_url` / `ntfy_url` | 推送通道，可配任一或都配 |
 | `cliproxyapi_auth_dir` | CLIProxyAPI 的 OAuth `*.json` 目录，Claude/Codex 自动发现 |
-| `accounts` | 手动账号，如 Kimi（`api_key` 或 `api_key_file`），或自定义标签的 Claude/Codex |
+| `accounts` | 手动账号，如 Kimi / GLM（`api_key` 或 `api_key_file`），或自定义标签的 Claude/Codex |
 | `relaxed_accounts` | 只保留"快用完"告警的账号标签 |
 | `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → 页面倒计时 + 到期提醒 |
 | `monthly_snapshot` | 手动维护的月度配额快照，显示在页面上 |
@@ -172,7 +173,7 @@ Plus/ProLite 套餐的 `wham/usage` 把周限额放在 `primary_window` 返回�
 
 - 所有凭据不出本机：OAuth 文件原地读取，Kimi key 存在 `chmod 600` 的文件里。
 - `config.json` 可能含密钥——已被 gitignore，不要提交。
-- 外发请求只有三个官方接口 + 你的推送通道。
+- 外发请求只有各家官方用量接口 + 你的推送通道。
 
 ## 路线图 / 贡献
 
