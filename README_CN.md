@@ -153,6 +153,30 @@ location /quota/ {
 
 `accounts` 留空也能跑：Claude/Codex 会从 `cliproxyapi_auth_dir` 自动发现，卡片标题就是认证文件名。想要好看的标题和副标题，再显式写进 `accounts` 即可——显式配过的认证文件不会被重复自动发现，所以两个 Codex 账号只写一个也不会漏掉另一个。
 
+## 新增 / 换掉一个账号
+
+这事没有网页表单可用，以后也不会有——API key 是凭据，不是显示偏好。浏览器里的设置面板（⚙️ 按钮）只碰 `localStorage`，管的是卡片顺序、主题这类东西，从来看不到、也不会发送或存储任何 key。加账号或换 key 是服务器端的、纯命令行操作：
+
+1. **key 单独存成一个文件，绝不写进 `config.json`。** 直接当命令行参数敲会留在 shell 历史里，用 heredoc 或重定向：
+   ```bash
+   cd ~/.local/share/llm-quota-watchdog   # 换成你实际部署的目录
+   cat > .glm-key-newaccount <<'EOF'
+   <把 key 粘贴到这里>
+   EOF
+   chmod 600 .glm-key-newaccount
+   ```
+2. **在 `config.json` 的 `accounts` 里加一项：**
+   ```json
+   {"label": "GLM Coding (小套餐)", "sub": "可选副标题", "api_key_file": ".glm-key-newaccount"}
+   ```
+   Claude/Codex 这种走 CLIProxyAPI 的账号，用 `"auth_file": "some-account.json"`（`cliproxyapi_auth_dir` 里的文件名）代替 `api_key_file`——不需要单独的 key 文件，OAuth token 已经在 CLIProxyAPI 手里。
+3. **手动跑一次 `page`**，等下一次 cron 之前先确认新卡片渲染正常：
+   ```bash
+   llm-quota-watchdog page --config config.json --account "GLM Coding (小套餐)"
+   ```
+4. **换 key**：同样两步——原地覆盖 key 文件（第 1 步）再跑一次 `page`；文件名没变的话 `config.json` 不用动。
+5. **删账号**：删掉 `accounts` 里对应项和它的 key 文件，同时检查 `relaxed_accounts` / `plan_expiry` / `monthly_snapshot` 里有没有引用它的旧 label（这几处都是按 label 字符串匹配的，改名后要一起改）。
+
 ## 部分刷新
 
 `page` 默认重新拉取所有账号。加上 `--account`（可重复）则只重新拉取指定账号，其余直接用 `page_state_file` 里的缓存渲染：

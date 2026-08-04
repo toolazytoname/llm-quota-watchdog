@@ -162,6 +162,30 @@ See [config.example.json](config.example.json) — every key has a sane default.
 
 Leaving `accounts` empty still works: Claude/Codex are auto-discovered from `cliproxyapi_auth_dir` and each card is titled after its auth filename. Add entries to `accounts` when you want nicer titles and subtitles — an auth file you configured explicitly is not auto-discovered a second time, so listing one of your two Codex accounts by hand won't drop the other.
 
+## Adding or rotating an account
+
+There's no web form for this, and there won't be — API keys are credentials, not display preferences. The browser settings panel (the ⚙️ button) only ever touches `localStorage` for things like card order and theme; it never sees, sends, or stores a key. Adding or rotating a key is a server-side, shell-only operation:
+
+1. **Save the key to its own file, never inline in `config.json`.** Typing it as a shell argument leaves it in your shell history; use a heredoc or redirect instead:
+   ```bash
+   cd ~/.local/share/llm-quota-watchdog   # or wherever you deployed it
+   cat > .glm-key-newaccount <<'EOF'
+   <paste the key here>
+   EOF
+   chmod 600 .glm-key-newaccount
+   ```
+2. **Add an entry to `accounts` in `config.json`:**
+   ```json
+   {"label": "GLM Coding (small plan)", "sub": "optional subtitle", "api_key_file": ".glm-key-newaccount"}
+   ```
+   For Claude/Codex behind CLIProxyAPI, use `"auth_file": "some-account.json"` (basename inside `cliproxyapi_auth_dir`) instead of `api_key_file` — no key file needed, CLIProxyAPI already holds the OAuth token.
+3. **Run `page` once by hand** to confirm the new card renders correctly before waiting for the next cron tick:
+   ```bash
+   llm-quota-watchdog page --config config.json --account "GLM Coding (small plan)"
+   ```
+4. **Rotating a key** is the same two steps: overwrite the file in place (step 1) and re-run `page`; no config.json change needed since the filename didn't change.
+5. **Removing an account**: delete its `accounts` entry and its key file. Also drop any references to its old label in `relaxed_accounts` / `plan_expiry` / `monthly_snapshot`, since those are matched by label string.
+
 ## Partial refresh
 
 `page` re-queries every account by default. With `--account` (repeatable) it re-queries only those, rendering the rest from `page_state_file`:
