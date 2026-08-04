@@ -126,10 +126,13 @@ location /quota/ {
     auth_basic "quota";
     auth_basic_user_file /etc/nginx/.htpasswd-quota;
     alias /home/YOU/.local/share/llm-quota-watchdog/www/;
+    add_header Cache-Control "no-cache, must-revalidate" always;
 }
 ```
 
 > ⚠️ 页面会暴露你的订阅用量，务必加密码或只放内网。
+>
+> ⚠️ `Cache-Control` 这行不要省。没有它的话，页面响应只有 `Last-Modified`/`ETag`，浏览器会按 HTTP 规范做启发式缓存——点"刷新"按钮（见下文[可选：按需刷新](#可选按需刷新)）时，fetch 跟随重定向可能直接命中浏览器本地缓存而不是真的打到服务器，即便页面其实已经重新生成好了，界面看起来还是像"点了没反应"。
 
 ## 配置说明
 
@@ -231,6 +234,9 @@ Plus/ProLite 套餐的 `wham/usage` 把周限额放在 `primary_window` 返回�
 
 **推送收不到？**
 先在服务器上 `curl` 你的 Bark/ntfy 地址确认可达。Bark 重装 App 后 key 会变，记得更新 `bark_url`。
+
+**点了刷新按钮没反应，数字就是不变？**
+`curl -sI` 查一下首页的响应头有没有 `Cache-Control`。如果只有 `Last-Modified`/`ETag`，浏览器会当成可以启发式缓存——刷新按钮的 `fetch()` 跟随重定向时可能直接命中浏览器本地缓存，而不是真的打到服务器，哪怕页面其实已经重新生成好了。给托管页面的 `location` 块加上 `add_header Cache-Control "no-cache, must-revalidate" always;`（见前面的 nginx 示例）就会强制每次都重新校验。
 
 ## 安全说明
 

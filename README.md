@@ -126,10 +126,13 @@ location /quota/ {
     auth_basic "quota";
     auth_basic_user_file /etc/nginx/.htpasswd-quota;
     alias /home/YOU/.local/share/llm-quota-watchdog/www/;
+    add_header Cache-Control "no-cache, must-revalidate" always;
 }
 ```
 
 > ⚠️ The dashboard reveals your subscription usage — put it behind auth or on a private network.
+>
+> ⚠️ Don't skip the `Cache-Control` line. Without it, the page has no cache headers besides `Last-Modified`/`ETag`, so browsers apply heuristic caching — the refresh button (see [Optional: on-demand refresh](#optional-on-demand-refresh)) can end up fetching a stale cached copy instead of the page it just regenerated, making clicks look like they do nothing.
 
 ## Manual install
 
@@ -243,6 +246,9 @@ The API returns `used`/`limit` counts; the tool converts to percentages.
 
 **My push notifications never arrive.**
 Make sure your Bark/ntfy URL is reachable from the host (`curl` it). Bark keys rotate if you reinstall the app — update `bark_url` after reinstalling.
+
+**I click refresh and nothing happens — the numbers just don't change.**
+Check the response headers for the main page (`curl -sI` it) for a `Cache-Control` line. If it's missing, your web server is only sending `Last-Modified`/`ETag`, which browsers treat as heuristically cacheable — the refresh button's `fetch()` can follow its redirect straight into your browser's local cache instead of hitting the server, even though the page really did get regenerated. Add `add_header Cache-Control "no-cache, must-revalidate" always;` to the `location` block serving the page (see the nginx example above) and it'll always revalidate.
 
 ## Security notes
 
