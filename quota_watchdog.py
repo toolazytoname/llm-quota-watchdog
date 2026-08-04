@@ -1358,7 +1358,7 @@ def card_html(cfg, acct, entry, health):
         exp_ts = parse_ts(str(exp) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
         if exp_ts:
             days = (exp_ts.date() - now_utc().astimezone(cfg["_tz"]).date()).days
-            expiry_html = '<div class="expiry">套餐周期 %d 天后重置（%s）</div>' % (max(days, 0), exp)
+            expiry_html = '<div class="expiry">套餐 %d 天后到期（%s）</div>' % (max(days, 0), exp)
 
     # status dot always shows (colour carries the state); a text label only
     # appears when something's wrong, so a healthy page is quiet dots not noise
