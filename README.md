@@ -25,11 +25,14 @@ llm-quota-watchdog polls the same endpoints the official CLIs use, renders a sin
 
 Per account: 5-hour / weekly / monthly (manual snapshot) progress bars with exact percentages, a time-progress marker on each bar, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. Dark theme, responsive multi-column grid that keeps even a long account list on one screen.
 
-A one-line summary at the top tells you who to worry about right now: `✅ 5/5 healthy · tightest: Codex Pro weekly 100% (resets in 4d)`. It turns amber when an account is close to its ceiling.
+A one-line summary at the top tells you who to worry about right now: `5/5 healthy, fullest is Codex Pro weekly 100%, resets in 4d`. It turns amber when an account is close to its ceiling.
 
 ![dashboard](docs/screenshot.png)
 
-The **⚙️ settings** panel is pure frontend — it lives in the visitor's `localStorage`, needs no backend, and doesn't change what anyone else sees:
+Two toolbar buttons:
+
+- **Privacy mode**: one click hides email subtitles, per-account fetch times, and the page timestamp for clean screenshots with no identifying info. Active only for the current tab (reloads clear), and the button turns amber so you remember to turn it off.
+- **Settings** — pure frontend, lives in the visitor's `localStorage`, needs no backend, doesn't change what anyone else sees:
 
 | What | Options |
 |---|---|
@@ -39,11 +42,11 @@ The **⚙️ settings** panel is pure frontend — it lives in the visitor's `lo
 | Sorting | custom order / by usage (most-burnt first) |
 | Details | health badge, card subtitle, reset time, pace hint, fetch time, plan expiry, top summary — each toggleable |
 | Auto refresh | off / 5 min – 3 h |
-| Backup | export/import settings as JSON, reset to defaults |
+| Backup | copy config / download file / paste-import / upload file, reset to defaults |
 
 ![mini density](docs/screenshot-mini.png)
 
-> Sharing a screenshot but don't want your email in it? Turn off "card subtitle".
+> Sharing a screenshot but don't want your email in it? Use the "Privacy mode" toolbar button instead.
 
 The page also has a "refresh all" button and a per-account refresh link. These are plain links to `/refresh` (optionally `?account=<label>`) — this repo doesn't ship a server for that endpoint, so if you don't wire one up the buttons just 404 and the static page itself is unaffected. See [Optional: on-demand refresh](#optional-on-demand-refresh) below for a minimal example.
 

@@ -670,14 +670,16 @@ def fmt_reset_page(cfg, ts):
 
 
 
-def bar_color(pct):
+def fill_class(pct):
+    """The bar fill is neutral until a window is actually near its ceiling;
+    colour is a signal, not decoration, so a healthy 40% is the same grey as 5%."""
     if pct is None:
-        return "#555"
-    if pct >= 85:
-        return "#e5534b"
-    if pct >= 60:
-        return "#d4a72c"
-    return "#3fb950"
+        return ""
+    if pct >= 90:
+        return "crit"
+    if pct >= 75:
+        return "high"
+    return ""
 
 
 def window_html(cfg, label, pct, reset, note="", elapsed=None):
@@ -690,27 +692,40 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None):
     marker_html = ""
     if elapsed is not None:
         marker_html = '<div class="time-marker" style="left:%.1f%%"></div>' % max(min(elapsed, 100), 0)
-    note_html = '<span class="note">%s</span>' % html.escape(note) if note else ""
+    # colour the pace verdict word only, not the whole meta line — fast burns
+    # amber, slow burns a muted blue, on-track stays dim grey
+    note_cls = ""
+    if note:
+        if "偏快" in note:
+            note_cls = " pace-fast"
+        elif "偏慢" in note:
+            note_cls = " pace-slow"
+    note_html = '<span class="note%s">%s</span>' % (note_cls, html.escape(note)) if note else ""
     reset_txt = fmt_reset_page(cfg, reset)
+    fc = fill_class(pct)
+    fill_cls = ("fill " + fc).strip()
     return """
     <div class="win" data-pct="%s" data-short="%s" data-reset-short="%s" title="%s">
-      <div class="win-head"><span>%s</span><span class="pct" style="color:%s">%s</span></div>
-      <div class="bar"><div class="fill" style="width:%.1f%%;background:%s"></div>%s</div>
+      <div class="win-head"><span>%s</span><span class="pct">%s</span></div>
+      <div class="bar"><div class="%s" style="width:%.1f%%"></div>%s</div>
       <div class="meta"><span class="reset">%s</span>%s</div>
     </div>""" % ("" if pct is None else "%.1f" % pct, html.escape(label),
                  html.escape(reset_left(reset)),
-                 html.escape("%s · %s%s" % (label, reset_txt, " · " + note if note else "")),
-                 html.escape(label), bar_color(pct), pct_txt,
-                 width, bar_color(pct), marker_html,
+                 html.escape("%s / %s%s" % (label, reset_txt, " / " + note if note else "")),
+                 html.escape(label), pct_txt,
+                 fill_cls, width, marker_html,
                  html.escape(reset_txt), note_html)
 
 
 
+# (css class, label). A healthy account renders as a bare dim dot with no text:
+# on a page where everything is fine, the status column should be silent rather
+# than five green badges competing with the numbers you actually came to read.
 BADGE = {
-    "ok": ("🟢", "正常"),
-    "token_expired": ("🔴", "Token 异常"),
-    "error": ("🟡", "查询异常"),
-    "unknown": ("⚪", "未知"),
+    "ok": ("ok", "正常"),
+    "token_expired": ("bad", "Token 异常"),
+    "error": ("warn", "查询异常"),
+    "unknown": ("idle", "未知"),
 }
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -720,55 +735,77 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>@TITLE@</title>
 <style>
+  /* Single dark substrate, one neutral ramp, one accent reserved for trouble.
+     Normal usage is just text on a bar; colour only appears to mean something
+     (a window near its ceiling, a dead token). Healthy == quiet. */
+  :root {
+    --bg: #0b0d10; --bg-2: #111418; --bg-3: #161a1f;
+    --line: #232830; --line-2: #2e343d;
+    --ink: #d7dde3; --ink-2: #8b949e; --ink-3: #5c6470;
+    --bar: #2a313a; --bar-fill: #c9d1d9;
+    --accent: #e09b3f;   /* near a ceiling */
+    --bad: #d9534f;      /* token dead / query failed */
+    --good: #4e9d6b;     /* recovered */
+    --mono: "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 16px; max-width: 1440px; margin: 0 auto; }
-  h1 { font-size: 20px; margin-bottom: 4px; }
-  .updated { color: #7d8590; font-size: 12px; margin-bottom: 10px; }
-  .summary { font-size: 13px; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; background: #161b22; border: 1px solid #30363d; color: #3fb950; }
-  .summary.warn { color: #d4a72c; border-color: #d4a72c; }
-  .summary.bad { color: #e5534b; border-color: #e5534b; }
-  .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; font-size: 13px; flex-wrap: wrap; }
-  .btn, .mini-btn { display: inline-block; background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; text-decoration: none; font-size: 12px; cursor: pointer; font-family: inherit; }
-  .btn:hover, .mini-btn:hover { background: #30363d; }
-  select, textarea { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 3px 6px; font-size: 12px; font-family: inherit; }
+  body { background: var(--bg); color: var(--ink); font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; padding: 20px; max-width: 1440px; margin: 0 auto; -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums; }
+  header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  .updated { color: var(--ink-3); font-size: 11px; font-family: var(--mono); }
+  .summary { font-size: 12.5px; padding: 7px 12px; margin-bottom: 14px; background: var(--bg-2); border-left: 2px solid var(--ink-3); color: var(--ink-2); line-height: 1.5; }
+  .summary.warn { border-left-color: var(--accent); color: var(--ink); }
+  .summary.bad { border-left-color: var(--bad); color: var(--ink); }
+  .controls { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+  .btn, .mini-btn { display: inline-flex; align-items: center; gap: 6px; background: transparent; color: var(--ink-2); border: 1px solid var(--line-2); border-radius: 4px; padding: 4px 11px; text-decoration: none; font-size: 12px; cursor: pointer; font-family: inherit; transition: color .15s, border-color .15s, background .15s; }
+  .btn:hover, .mini-btn:hover { color: var(--ink); border-color: var(--ink-3); background: var(--bg-2); }
+  .btn:active, .mini-btn:active { transform: translateY(1px); }
+  .btn:focus-visible, .mini-btn:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  select, textarea { background: var(--bg); color: var(--ink); border: 1px solid var(--line-2); border-radius: 4px; padding: 4px 8px; font-size: 12px; font-family: inherit; }
+  .gear { width: 13px; height: 13px; opacity: .8; }
 
-  #cards { display: grid; grid-template-columns: repeat(var(--cols, auto-fill), minmax(300px, 1fr)); gap: 14px; align-items: start; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; }
+  #cards { display: grid; grid-template-columns: repeat(var(--cols, auto-fill), minmax(300px, 1fr)); gap: 0; align-items: start; border-top: 1px solid var(--line); }
+  .card { padding: 14px 2px; border-bottom: 1px solid var(--line); }
   .card.hidden { display: none; }
-  .card h2 { font-size: 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-weight: 600; }
-  .title { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
-  .title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .plan { color: #7d8590; font-size: 11px; font-weight: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .card-actions { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: normal; white-space: nowrap; }
-  .badge { color: #7d8590; }
-  .win { margin-bottom: 14px; }
+  .card h2 { font-size: 13.5px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-weight: 600; }
+  .title { display: flex; flex-direction: column; gap: 0; min-width: 0; }
+  .title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: -.005em; }
+  .plan { color: var(--ink-3); font-size: 10.5px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+  .card-actions { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 400; white-space: nowrap; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--ink-2); }
+  .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .badge.b-warn { color: var(--accent); }
+  .badge.b-bad { color: var(--bad); }
+  .badge.b-idle { color: var(--ink-3); }
+  .wins { }
+  .win { margin-bottom: 11px; }
   .win:last-child { margin-bottom: 0; }
-  .win-head { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; margin-bottom: 5px; }
-  .pct { font-weight: 600; }
-  .bar { position: relative; background: #30363d; border-radius: 6px; height: 10px; overflow: hidden; }
-  .fill { height: 100%; border-radius: 6px; transition: width .3s; }
-  .time-marker { position: absolute; top: 0; bottom: 0; width: 2px; background: #e6edf3; opacity: .85; }
-  .meta { margin-top: 5px; }
-  .reset { color: #7d8590; font-size: 12px; display: block; }
-  .note { color: #7d8590; font-size: 11px; font-style: italic; display: block; margin-top: 3px; }
-  .err { color: #e5534b; font-size: 13px; }
-  .expiry { color: #d4a72c; font-size: 12px; margin-top: 10px; }
-  .fetched { color: #6e7681; font-size: 11px; margin-top: 10px; }
+  .win-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; margin-bottom: 4px; color: var(--ink-2); }
+  .win-head > span:first-child { letter-spacing: .02em; }
+  .pct { font-weight: 600; color: var(--ink); font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .bar { position: relative; background: var(--bar); height: 4px; overflow: visible; }
+  .fill { height: 100%; background: var(--bar-fill); transition: width .3s; }
+  .fill.high { background: var(--accent); }
+  .fill.crit { background: var(--bad); }
+  .time-marker { position: absolute; top: -2px; bottom: -2px; width: 1px; background: var(--ink-3); opacity: .9; }
+  .meta { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+  .reset { color: var(--ink-3); font-size: 10.5px; font-family: var(--mono); }
+  .note { color: var(--ink-3); font-size: 10.5px; }
+  .note.pace-fast { color: var(--accent); }
+  .note.pace-slow { color: #6a8caf; }
+  .err { color: var(--bad); font-size: 12px; }
+  .expiry { color: var(--ink-2); font-size: 10.5px; margin-top: 9px; font-family: var(--mono); }
+  .fetched { color: var(--ink-3); font-size: 10px; margin-top: 9px; font-family: var(--mono); }
 
-  /* density: compact (default) — same information, less air */
-  body.d-compact .card { padding: 12px; }
-  body.d-compact .card h2 { margin-bottom: 9px; font-size: 15px; }
-  body.d-compact .win { margin-bottom: 10px; }
-  body.d-compact .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
-  body.d-compact .reset, body.d-compact .note { font-size: 11px; margin-top: 0; display: inline; }
-  body.d-compact .note::before { content: "· "; }
-  body.d-compact .fetched, body.d-compact .expiry { margin-top: 7px; }
+  /* density: compact (default) — collapse the meta line, keep the air tight */
+  body.d-compact .card { padding: 12px 2px; }
+  body.d-compact .note::before { content: ""; }
 
-  /* density: mini — one row per account, everything but the bars stripped */
-  body.d-mini #cards { grid-template-columns: 1fr; gap: 6px; }
-  body.d-mini .card { display: flex; align-items: center; gap: 14px; padding: 8px 12px; }
+  /* density: mini — one row per account, bars only */
+  body.d-mini #cards { grid-template-columns: 1fr; }
+  body.d-mini .card { display: flex; align-items: center; gap: 14px; padding: 9px 2px; }
   body.d-mini .card h2 { display: contents; }
-  body.d-mini .title { flex: 0 0 clamp(110px, 18vw, 200px); font-size: 14px; }
+  body.d-mini .title { flex: 0 0 clamp(108px, 17vw, 190px); font-size: 13px; }
   body.d-mini .card-actions { order: 9; }
   /* fixed columns so the same window lines up down the whole page: 5h left,
      weekly right, and the (rare, manual) monthly snapshot on its own row */
@@ -777,8 +814,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   body.d-mini .win[data-short="5小时"] { grid-column: 1; }
   body.d-mini .win[data-short="7天"] { grid-column: 2; }
   body.d-mini .win[data-short="月度"] { grid-column: 1; }
-  body.d-mini .win-head { font-size: 12px; margin-bottom: 3px; }
-  body.d-mini .bar { height: 8px; }
+  body.d-mini .win-head { font-size: 10.5px; margin-bottom: 3px; }
+  body.d-mini .bar { height: 4px; }
   body.d-mini .meta, body.d-mini .expiry, body.d-mini .fetched, body.d-mini .plan { display: none; }
 
   /* per-item visibility toggles from the settings panel */
@@ -790,31 +827,45 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   body.hide-expiry .expiry { display: none; }
   body.hide-summary #summary { display: none; }
 
+  /* privacy/share mode: one-click strip of anything that identifies you
+     (emails in subtitles, fetch timestamps, the page timestamp) for clean
+     screenshots. Stays on only for this tab; reload drops it. */
+  body.share-mode .plan,
+  body.share-mode .fetched,
+  body.share-mode .updated { display: none !important; }
+  body.share-mode #share-toggle { color: var(--accent); border-color: var(--accent); }
+  #share-toggle { position: relative; }
+
   /* settings panel */
-  .modal { position: fixed; inset: 0; background: rgba(1,4,9,.7); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal { position: fixed; inset: 0; background: rgba(6,8,10,.78); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
   .modal[hidden] { display: none; }
-  .modal-box { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; width: 420px; max-width: 100%; max-height: 85vh; overflow: auto; font-size: 13px; }
-  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .modal-box { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 18px; width: 420px; max-width: 100%; max-height: 85vh; overflow: auto; font-size: 12.5px; }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; color: var(--ink-2); }
   .set-row select { min-width: 150px; }
-  .set-sec { color: #7d8590; font-size: 12px; margin: 14px 0 6px; border-top: 1px solid #30363d; padding-top: 10px; }
+  .set-sec { color: var(--ink-3); font-size: 11px; margin: 16px 0 6px; border-top: 1px solid var(--line); padding-top: 12px; letter-spacing: .02em; }
   .set-acct { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; }
-  .set-acct label { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-acct label { display: flex; align-items: center; gap: 7px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .set-acct button { padding: 1px 8px; }
   .set-acct button[disabled] { opacity: .35; cursor: default; }
-  #set-show label { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
-  #set-json { width: 100%; margin-top: 6px; font-size: 11px; }
+  #set-show label { display: flex; align-items: center; gap: 7px; padding: 3px 0; color: var(--ink-2); }
+  #set-json { width: 100%; margin-top: 6px; font-size: 11px; font-family: var(--mono); }
+  .set-backup { display: flex; flex-wrap: wrap; gap: 8px; }
   .set-btns { display: flex; gap: 8px; margin-top: 8px; }
-  .set-hint { color: #6e7681; font-size: 11px; margin-top: 8px; }
+  .set-hint { color: var(--ink-3); font-size: 10.5px; margin-top: 10px; line-height: 1.5; }
+  .mini-btn.flash { color: var(--good); border-color: var(--good); }
 </style>
 </head>
 <body class="d-compact">
-<h1>📊 @TITLE@</h1>
-<div class="updated" id="updated">数据更新于 @UPDATED@ · llm-quota-watchdog</div>
+<header class="top">
+  <h1>@TITLE@</h1>
+  <span class="updated" id="updated">@UPDATED@ · llm-quota-watchdog</span>
+</header>
 <div id="summary" class="summary">@SUMMARY@</div>
 <div class="controls">
-  <a class="btn refresh-link" href="/refresh">🔄 全部刷新</a>
-  <button class="btn" id="open-settings">⚙️ 设置</button>
+  <a class="btn refresh-link" href="/refresh">刷新全部</a>
+  <button class="btn" id="share-toggle" title="隐藏邮箱、时间戳等可识别信息，方便截图分享">隐私模式</button>
+  <button class="btn" id="open-settings"><svg class="gear" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.3 3.3l1.4 1.4M11.3 11.3l1.4 1.4M3.3 12.7l1.4-1.4M11.3 4.7l1.4-1.4"/></svg>显示设置</button>
 </div>
 <div id="cards">@CARDS@</div>
 
@@ -840,13 +891,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="set-sec">显示哪些内容</div>
     <div id="set-show"></div>
     <div class="set-sec">备份与重置</div>
-    <textarea id="set-json" rows="3" placeholder="点“导出”把设置复制走，或粘贴一段设置后点“导入”"></textarea>
+    <div class="set-backup">
+      <button class="mini-btn" id="set-export">复制配置</button>
+      <button class="mini-btn" id="set-download">下载文件</button>
+      <button class="mini-btn" id="set-import">粘贴导入</button>
+      <button class="mini-btn" id="set-upload">上传文件</button>
+      <input type="file" id="set-file" accept="application/json,.json" hidden>
+    </div>
     <div class="set-btns">
-      <button class="mini-btn" id="set-export">导出</button>
-      <button class="mini-btn" id="set-import">导入</button>
       <button class="mini-btn" id="set-reset">恢复默认</button>
     </div>
-    <div class="set-hint">设置只存在这个浏览器里（localStorage），不会上传，也不影响别人看到的页面。</div>
+    <div class="set-hint">设置只存在这个浏览器里（localStorage），不会上传，也不影响别人看到的页面。换电脑时用「下载文件」带走，「上传文件」恢复。</div>
   </div>
 </div>
 
@@ -923,7 +978,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var el = document.getElementById('summary');
     if (!el) return;
     var vis = cards().filter(function(c){ return !c.classList.contains('hidden'); });
-    if (!vis.length) { el.textContent = '没有显示中的账号 · 去 ⚙️ 设置里打开几个'; el.className = 'summary'; return; }
+    if (!vis.length) { el.textContent = '没有显示中的账号，点右上角“显示设置”打开几个'; el.className = 'summary'; return; }
     var ok = 0, unknown = 0, bad = [], worst = null;
     vis.forEach(function(c){
       var h = c.getAttribute('data-health') || '';
@@ -937,14 +992,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
           win: w.getAttribute('data-short') || '', reset: w.getAttribute('data-reset-short') || ''};
       });
     });
-    var parts = [];
-    if (bad.length) parts.push('⚠️ ' + bad.join('、') + ' 异常');
-    else if (ok) parts.push('✅ ' + ok + '/' + vis.length + ' 正常');
-    else if (unknown) parts.push('⚪ 健康检查暂不可用');
-    if (worst) parts.push('最紧张：' + worst.acct + ' ' + worst.win + ' ' + Math.round(worst.pct) + '%'
-                          + (worst.reset ? '（' + worst.reset + '重置）' : ''));
-    el.textContent = parts.join(' · ') || '—';
-    // an account sitting at 90% is worth noticing even when every token is healthy
+    var head;
+    if (bad.length) head = bad.length + ' 个异常：' + bad.join('、');
+    else if (ok) head = ok + '/' + vis.length + ' 正常';
+    else head = '健康检查暂不可用';
+    if (worst) head += '，额度最高 ' + worst.acct + ' ' + worst.win + ' ' + Math.round(worst.pct) + '%'
+                     + (worst.reset ? '，' + worst.reset + '重置' : '');
+    el.textContent = head;
+    // an account sitting near its ceiling is worth noticing even with every token healthy
     el.className = 'summary' + (bad.length ? ' bad' : (worst && worst.pct >= 85 ? ' warn' : ''));
   }
 
@@ -1071,22 +1126,71 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   bindSelect('set-sort', 'sort', false);
   bindSelect('set-refresh', 'autoRefresh', true);
 
+  // ---- privacy / share mode: session-only, not persisted ----
+  var shareBtn = document.getElementById('share-toggle');
+  shareBtn.onclick = function(){
+    document.body.classList.toggle('share-mode');
+    var on = document.body.classList.contains('share-mode');
+    shareBtn.textContent = on ? '退出隐私模式' : '隐私模式';
+  };
+
+  // ---- backup: copy / download / paste-import / upload-file ----
+  function flash(btn, text){
+    var prev = btn.textContent;
+    btn.textContent = text; btn.classList.add('flash');
+    setTimeout(function(){ btn.textContent = prev; btn.classList.remove('flash'); }, 1400);
+  }
+  function importText(text, btn){
+    var obj;
+    try { obj = JSON.parse(text); }
+    catch (e) { flash(btn, '格式不对'); return false; }
+    if (!obj || typeof obj !== 'object') { flash(btn, '格式不对'); return false; }
+    try { localStorage.setItem(KEY, JSON.stringify(obj)); }
+    catch (e) { flash(btn, '格式不对'); return false; }
+    load(); apply(); buildPanel();
+    flash(btn, '已导入');
+    return true;
+  }
   document.getElementById('set-export').onclick = function(){
-    var ta = document.getElementById('set-json');
-    ta.value = JSON.stringify(S);
-    ta.select();
+    var btn = this, text = JSON.stringify(S, null, 2);
+    // clipboard is gated behind https / localhost; fall back to a prompt so the
+    // button is never a no-op on plain-http or file://
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function(){ flash(btn, '已复制'); }, function(){ window.prompt('复制这段配置：', text); });
+    } else { window.prompt('复制这段配置：', text); }
+  };
+  document.getElementById('set-download').onclick = function(){
+    var blob = new Blob([JSON.stringify(S, null, 2)], {type: 'application/json'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = 'quota-settings.json'; a.click();
+    URL.revokeObjectURL(url);
+    flash(this, '已下载');
   };
   document.getElementById('set-import').onclick = function(){
-    var ta = document.getElementById('set-json');
-    try { localStorage.setItem(KEY, JSON.stringify(JSON.parse(ta.value))); }
-    catch (e) { ta.value = '这段设置解析不了：' + e.message; return; }
-    load(); apply(); buildPanel();
-    ta.value = '已导入 ✓';
+    var btn = this;
+    if (navigator.clipboard && navigator.clipboard.readText) {
+      navigator.clipboard.readText().then(function(t){ if (t) importText(t, btn); })
+        .catch(function(){ var t = window.prompt('粘贴一段配置 JSON：'); if (t) importText(t, btn); });
+    } else {
+      var t = window.prompt('粘贴一段配置 JSON：');
+      if (t) importText(t, btn);
+    }
+  };
+  document.getElementById('set-upload').onclick = function(){ document.getElementById('set-file').click(); };
+  document.getElementById('set-file').onchange = function(e){
+    var f = e.target.files[0], btn = document.getElementById('set-upload');
+    if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function(){ importText(rd.result, btn); };
+    rd.readAsText(f);
+    e.target.value = '';  // let the same file be picked again later
   };
   document.getElementById('set-reset').onclick = function(){
     S = defaults();
     localStorage.removeItem('quotaAutoRefresh');
     save(); apply(); buildPanel();
+    flash(this, '已恢复');
   };
 
   load();
@@ -1188,12 +1292,15 @@ def card_html(cfg, acct, entry, health):
         exp_ts = parse_ts(str(exp) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
         if exp_ts:
             days = (exp_ts.date() - now_utc().astimezone(cfg["_tz"]).date()).days
-            expiry_html = '<div class="expiry">📅 套餐周期 %d 天后重置（%s）</div>' % (max(days, 0), exp)
+            expiry_html = '<div class="expiry">套餐周期 %d 天后重置（%s）</div>' % (max(days, 0), exp)
 
     badge_html = ""
-    if health is not None:
-        dot, htext = BADGE[health]
-        badge_html = '<span class="badge">%s %s</span>' % (dot, html.escape(htext))
+    if health is not None and health != "ok":
+        # healthy is the common case: render a quiet dot, no text. Only problems
+        # earn a label, so a fully-healthy page isn't five green badges shouting
+        # over the numbers.
+        cls, htext = BADGE[health]
+        badge_html = '<span class="badge b-%s"><i class="dot"></i>%s</span>' % (cls, html.escape(htext))
     sub_html = ""
     if acct.get("sub"):
         sub_html = '<span class="plan">%s</span>' % html.escape(str(acct["sub"]))
@@ -1226,11 +1333,11 @@ def render_page(cfg, page_state, accounts):
     # server-rendered fallback; the page's script recomputes this from whichever
     # cards the visitor actually kept visible
     if unhealthy:
-        summary = "⚠️ %s 异常，其余正常" % "、".join(unhealthy)
+        summary = "%d 个异常：%s，其余正常" % (len(unhealthy), "、".join(unhealthy))
     elif healthy:
-        summary = "✅ %d/%d 正常" % (healthy, len(accounts))
+        summary = "%d/%d 正常" % (healthy, len(accounts))
     else:
-        summary = "⚪ 健康检查暂不可用"
+        summary = "健康检查暂不可用"
 
     return (PAGE_TEMPLATE
             .replace("@TITLE@", html.escape(cfg.get("page_title") or DEFAULTS["page_title"]))
