@@ -704,15 +704,18 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None):
     reset_txt = fmt_reset_page(cfg, reset)
     fc = fill_class(pct)
     fill_cls = ("fill " + fc).strip()
+    # the percentage picks up the same state colour as its bar, so a near-ceiling
+    # window reads amber at a glance from the number alone
+    pct_cls = ("pct " + fc).strip()
     return """
     <div class="win" data-pct="%s" data-short="%s" data-reset-short="%s" title="%s">
-      <div class="win-head"><span>%s</span><span class="pct">%s</span></div>
+      <div class="win-head"><span>%s</span><span class="%s">%s</span></div>
       <div class="bar"><div class="%s" style="width:%.1f%%"></div>%s</div>
       <div class="meta"><span class="reset">%s</span>%s</div>
     </div>""" % ("" if pct is None else "%.1f" % pct, html.escape(label),
                  html.escape(reset_left(reset)),
                  html.escape("%s / %s%s" % (label, reset_txt, " / " + note if note else "")),
-                 html.escape(label), pct_txt,
+                 html.escape(label), pct_cls, pct_txt,
                  fill_cls, width, marker_html,
                  html.escape(reset_txt), note_html)
 
@@ -734,88 +737,139 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>@TITLE@</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  /* Single dark substrate, one neutral ramp, one accent reserved for trouble.
-     Normal usage is just text on a bar; colour only appears to mean something
-     (a window near its ceiling, a dead token). Healthy == quiet. */
+  /* Two themes share this one stylesheet: a polished dark (A) and a warm light
+     (C). The page defaults to the OS preference and lets the visitor pin one.
+     Variables live on :root for the dark default, are flipped by a
+     prefers-color-scheme media query, and body.theme-dark / body.theme-light
+     override either way for an explicit choice (a class on body beats the
+     :root media query for body's subtree via inheritance). */
   :root {
-    --bg: #0b0d10; --bg-2: #111418; --bg-3: #161a1f;
-    --line: #232830; --line-2: #2e343d;
-    --ink: #d7dde3; --ink-2: #8b949e; --ink-3: #5c6470;
-    --bar: #2a313a; --bar-fill: #c9d1d9;
-    --accent: #e09b3f;   /* near a ceiling */
-    --bad: #d9534f;      /* token dead / query failed */
-    --good: #4e9d6b;     /* recovered */
-    --mono: "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --bg: #0a0b0d; --bg-2: #131518;
+    --card: #131518; --card-border: #1e2024;
+    --card-shadow: inset 0 1px 0 rgba(255,255,255,.03), 0 8px 24px rgba(0,0,0,.35);
+    --card-alert-border: #3a2a18; --card-alert-bg: var(--card);
+    --ink: #e6e7ea; --ink-2: #9ca3af; --ink-3: #6b7280;
+    --bar-track: #23262c;
+    --accent: #3ecf8e; --accent-ink: #04130c;
+    --warn: #f5a524; --bad: #f87171; --good: #3ecf8e;
+    --summary-bg: #131518; --summary-border: #1e2024;
+    --ui-font: "Space Grotesk"; --num-weight: 300;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --radius: 16px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f6f3; --bg-2: #ffffff;
+      --card: #ffffff; --card-border: #eceae4;
+      --card-shadow: 0 1px 2px rgba(43,42,39,.04);
+      --card-alert-border: #e9c9a8; --card-alert-bg: #fdf8f0;
+      --ink: #2b2a27; --ink-2: #6b6960; --ink-3: #9b988f;
+      --bar-track: #f0eee8;
+      --accent: #4f9d7a; --accent-ink: #ffffff;
+      --warn: #d18a3e; --bad: #c0492f; --good: #4f9d7a;
+      --summary-bg: #ffffff; --summary-border: #eceae4;
+      --ui-font: "Manrope"; --num-weight: 600;
+    }
+  }
+  body.theme-dark {
+    --bg: #0a0b0d; --bg-2: #131518; --card: #131518; --card-border: #1e2024;
+    --card-shadow: inset 0 1px 0 rgba(255,255,255,.03), 0 8px 24px rgba(0,0,0,.35);
+    --card-alert-border: #3a2a18; --card-alert-bg: var(--card);
+    --ink: #e6e7ea; --ink-2: #9ca3af; --ink-3: #6b7280; --bar-track: #23262c;
+    --accent: #3ecf8e; --accent-ink: #04130c; --warn: #f5a524; --bad: #f87171; --good: #3ecf8e;
+    --summary-bg: #131518; --summary-border: #1e2024; --ui-font: "Space Grotesk"; --num-weight: 300;
+  }
+  body.theme-light {
+    --bg: #f7f6f3; --bg-2: #ffffff; --card: #ffffff; --card-border: #eceae4;
+    --card-shadow: 0 1px 2px rgba(43,42,39,.04);
+    --card-alert-border: #e9c9a8; --card-alert-bg: #fdf8f0;
+    --ink: #2b2a27; --ink-2: #6b6960; --ink-3: #9b988f; --bar-track: #f0eee8;
+    --accent: #4f9d7a; --accent-ink: #ffffff; --warn: #d18a3e; --bad: #c0492f; --good: #4f9d7a;
+    --summary-bg: #ffffff; --summary-border: #eceae4; --ui-font: "Manrope"; --num-weight: 600;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--ink); font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; padding: 20px; max-width: 1440px; margin: 0 auto; -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums; }
-  header.top { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
-  h1 { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--ui-font), -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; padding: 28px 32px; max-width: 1440px; margin: 0 auto; -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums; transition: background .25s, color .25s; }
+  header.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 6px; }
+  h1 { font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
   .updated { color: var(--ink-3); font-size: 11px; font-family: var(--mono); }
-  .summary { font-size: 12.5px; padding: 7px 12px; margin-bottom: 14px; background: var(--bg-2); border-left: 2px solid var(--ink-3); color: var(--ink-2); line-height: 1.5; }
-  .summary.warn { border-left-color: var(--accent); color: var(--ink); }
-  .summary.bad { border-left-color: var(--bad); color: var(--ink); }
-  .controls { display: flex; align-items: center; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
-  .btn, .mini-btn { display: inline-flex; align-items: center; gap: 6px; background: transparent; color: var(--ink-2); border: 1px solid var(--line-2); border-radius: 4px; padding: 4px 11px; text-decoration: none; font-size: 12px; cursor: pointer; font-family: inherit; transition: color .15s, border-color .15s, background .15s; }
-  .btn:hover, .mini-btn:hover { color: var(--ink); border-color: var(--ink-3); background: var(--bg-2); }
+  .summary { font-size: 13px; padding: 11px 15px; margin: 14px 0 22px; background: var(--summary-bg); border: 1px solid var(--summary-border); border-radius: 12px; color: var(--ink-2); line-height: 1.5; }
+  .summary b { color: var(--ink); font-weight: 500; }
+  .summary.warn, .summary.bad { border-color: var(--warn); }
+  .summary .hi { color: var(--warn); font-weight: 500; }
+  .summary.bad .hi, .summary.bad { border-color: var(--bad); }
+  .controls { display: flex; align-items: center; gap: 10px; margin-bottom: 26px; flex-wrap: wrap; }
+  .btn, .mini-btn { display: inline-flex; align-items: center; gap: 6px; background: var(--card); color: var(--ink-2); border: 1px solid var(--card-border); border-radius: 10px; padding: 7px 14px; text-decoration: none; font-size: 12.5px; cursor: pointer; font-family: inherit; font-weight: 500; transition: color .15s, border-color .15s, background .15s, transform .1s; }
+  .btn:hover, .mini-btn:hover { color: var(--ink); border-color: var(--ink-3); }
   .btn:active, .mini-btn:active { transform: translateY(1px); }
   .btn:focus-visible, .mini-btn:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  select, textarea { background: var(--bg); color: var(--ink); border: 1px solid var(--line-2); border-radius: 4px; padding: 4px 8px; font-size: 12px; font-family: inherit; }
-  .gear { width: 13px; height: 13px; opacity: .8; }
+  .btn.primary { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+  .btn.primary:hover { filter: brightness(1.05); color: var(--accent-ink); }
+  select, textarea { background: var(--bg); color: var(--ink); border: 1px solid var(--card-border); border-radius: 8px; padding: 5px 9px; font-size: 12px; font-family: inherit; }
+  .gear { width: 13px; height: 13px; opacity: .85; }
 
-  #cards { display: grid; grid-template-columns: repeat(var(--cols, auto-fill), minmax(300px, 1fr)); gap: 0; align-items: start; border-top: 1px solid var(--line); }
-  .card { padding: 14px 2px; border-bottom: 1px solid var(--line); }
+  #cards { display: grid; grid-template-columns: repeat(var(--cols, auto-fill), minmax(300px, 1fr)); gap: 16px; align-items: start; }
+  .card { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 20px; box-shadow: var(--card-shadow); position: relative; }
+  .card.alert { border-color: var(--card-alert-border); background: var(--card-alert-bg); }
   .card.hidden { display: none; }
-  .card h2 { font-size: 13.5px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-weight: 600; }
-  .title { display: flex; flex-direction: column; gap: 0; min-width: 0; }
-  .title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: -.005em; }
-  .plan { color: var(--ink-3); font-size: 10.5px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
-  .card-actions { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 400; white-space: nowrap; }
-  .badge { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--ink-2); }
-  .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-  .badge.b-warn { color: var(--accent); }
-  .badge.b-bad { color: var(--bad); }
-  .badge.b-idle { color: var(--ink-3); }
-  .wins { }
-  .win { margin-bottom: 11px; }
+  .card h2 { font-size: 14.5px; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; font-weight: 600; letter-spacing: -.01em; }
+  .title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plan { color: var(--ink-3); font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+  .card-actions { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 400; white-space: nowrap; flex-shrink: 0; }
+  .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--ink-2); font-weight: 500; }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
+  .badge.b-warn { color: var(--warn); } .badge.b-warn .dot { background: var(--warn); }
+  .badge.b-bad { color: var(--bad); } .badge.b-bad .dot { background: var(--bad); }
+  .badge.b-idle { color: var(--ink-3); } .badge.b-idle .dot { background: var(--ink-3); }
+  .wins { margin-top: 16px; }
+  .win { margin-bottom: 16px; }
   .win:last-child { margin-bottom: 0; }
-  .win-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 11px; margin-bottom: 4px; color: var(--ink-2); }
-  .win-head > span:first-child { letter-spacing: .02em; }
-  .pct { font-weight: 600; color: var(--ink); font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
-  .bar { position: relative; background: var(--bar); height: 4px; overflow: visible; }
-  .fill { height: 100%; background: var(--bar-fill); transition: width .3s; }
-  .fill.high { background: var(--accent); }
+  .win-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+  .win-head > span:first-child { font-size: 11px; color: var(--ink-3); letter-spacing: .04em; text-transform: uppercase; font-weight: 500; }
+  .pct { font-family: var(--ui-font); font-weight: var(--num-weight); color: var(--ink); font-size: 30px; letter-spacing: -.03em; line-height: 1; font-variant-numeric: tabular-nums; }
+  .pct.warn { color: var(--warn); }
+  .pct.crit { color: var(--bad); }
+  .bar { position: relative; background: var(--bar-track); height: 6px; border-radius: 99px; overflow: visible; }
+  .fill { height: 100%; background: var(--accent); border-radius: 99px; transition: width .3s; }
+  .fill.high { background: var(--warn); }
   .fill.crit { background: var(--bad); }
-  .time-marker { position: absolute; top: -2px; bottom: -2px; width: 1px; background: var(--ink-3); opacity: .9; }
-  .meta { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+  .time-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink-3); opacity: .55; border-radius: 1px; }
+  .meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
   .reset { color: var(--ink-3); font-size: 10.5px; font-family: var(--mono); }
   .note { color: var(--ink-3); font-size: 10.5px; }
-  .note.pace-fast { color: var(--accent); }
+  .note.pace-fast { color: var(--warn); }
   .note.pace-slow { color: #6a8caf; }
-  .err { color: var(--bad); font-size: 12px; }
-  .expiry { color: var(--ink-2); font-size: 10.5px; margin-top: 9px; font-family: var(--mono); }
-  .fetched { color: var(--ink-3); font-size: 10px; margin-top: 9px; font-family: var(--mono); }
+  .err { color: var(--bad); font-size: 12.5px; }
+  .expiry { color: var(--ink-2); font-size: 10.5px; margin-top: 12px; font-family: var(--mono); }
+  .fetched { color: var(--ink-3); font-size: 10px; margin-top: 12px; font-family: var(--mono); }
 
-  /* density: compact (default) — collapse the meta line, keep the air tight */
-  body.d-compact .card { padding: 12px 2px; }
-  body.d-compact .note::before { content: ""; }
+  /* density: compact — smaller hero number, tighter cards, more per screen */
+  body.d-compact .card { padding: 15px; }
+  body.d-compact .wins { margin-top: 12px; }
+  body.d-compact .win { margin-bottom: 11px; }
+  body.d-compact .pct { font-size: 21px; }
+  body.d-compact .win-head { margin-bottom: 5px; }
+  body.d-compact .meta { margin-top: 6px; }
 
   /* density: mini — one row per account, bars only */
-  body.d-mini #cards { grid-template-columns: 1fr; }
-  body.d-mini .card { display: flex; align-items: center; gap: 14px; padding: 9px 2px; }
+  body.d-mini #cards { grid-template-columns: 1fr; gap: 8px; }
+  body.d-mini .card { display: flex; align-items: center; gap: 14px; padding: 11px 16px; }
   body.d-mini .card h2 { display: contents; }
-  body.d-mini .title { flex: 0 0 clamp(108px, 17vw, 190px); font-size: 13px; }
+  body.d-mini .title { flex: 0 0 clamp(108px, 17vw, 190px); font-size: 13.5px; }
   body.d-mini .card-actions { order: 9; }
-  /* fixed columns so the same window lines up down the whole page: 5h left,
-     weekly right, and the (rare, manual) monthly snapshot on its own row */
-  body.d-mini .wins { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; min-width: 0; }
+  body.d-mini .wins { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; min-width: 0; margin-top: 0; }
   body.d-mini .win { margin-bottom: 0; }
   body.d-mini .win[data-short="5小时"] { grid-column: 1; }
   body.d-mini .win[data-short="7天"] { grid-column: 2; }
   body.d-mini .win[data-short="月度"] { grid-column: 1; }
-  body.d-mini .win-head { font-size: 10.5px; margin-bottom: 3px; }
-  body.d-mini .bar { height: 4px; }
+  body.d-mini .win-head { margin-bottom: 3px; }
+  body.d-mini .win-head > span:first-child { font-size: 10px; }
+  body.d-mini .pct { font-size: 14px; font-weight: 600; }
+  body.d-mini .bar { height: 5px; }
   body.d-mini .meta, body.d-mini .expiry, body.d-mini .fetched, body.d-mini .plan { display: none; }
 
   /* per-item visibility toggles from the settings panel */
@@ -837,33 +891,34 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   #share-toggle { position: relative; }
 
   /* settings panel */
-  .modal { position: fixed; inset: 0; background: rgba(6,8,10,.78); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal { position: fixed; inset: 0; background: rgba(6,8,10,.6); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
   .modal[hidden] { display: none; }
-  .modal-box { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 18px; width: 420px; max-width: 100%; max-height: 85vh; overflow: auto; font-size: 12.5px; }
-  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
-  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; color: var(--ink-2); }
+  .modal-box { background: var(--bg-2); border: 1px solid var(--card-border); border-radius: 14px; padding: 20px; width: 420px; max-width: 100%; max-height: 85vh; overflow: auto; font-size: 12.5px; box-shadow: 0 12px 40px rgba(0,0,0,.4); }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .modal-head b { font-size: 14px; font-weight: 600; }
+  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 9px; color: var(--ink-2); }
   .set-row select { min-width: 150px; }
-  .set-sec { color: var(--ink-3); font-size: 11px; margin: 16px 0 6px; border-top: 1px solid var(--line); padding-top: 12px; letter-spacing: .02em; }
-  .set-acct { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; }
-  .set-acct label { display: flex; align-items: center; gap: 7px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .set-acct button { padding: 1px 8px; }
+  .set-sec { color: var(--ink-3); font-size: 11px; margin: 18px 0 8px; border-top: 1px solid var(--card-border); padding-top: 14px; letter-spacing: .04em; text-transform: uppercase; font-weight: 500; }
+  .set-sec:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+  .set-acct { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 0; }
+  .set-acct label { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+  .set-acct button { padding: 1px 9px; }
   .set-acct button[disabled] { opacity: .35; cursor: default; }
-  #set-show label { display: flex; align-items: center; gap: 7px; padding: 3px 0; color: var(--ink-2); }
-  #set-json { width: 100%; margin-top: 6px; font-size: 11px; font-family: var(--mono); }
+  #set-show label { display: flex; align-items: center; gap: 8px; padding: 4px 0; color: var(--ink); }
   .set-backup { display: flex; flex-wrap: wrap; gap: 8px; }
   .set-btns { display: flex; gap: 8px; margin-top: 8px; }
-  .set-hint { color: var(--ink-3); font-size: 10.5px; margin-top: 10px; line-height: 1.5; }
+  .set-hint { color: var(--ink-3); font-size: 10.5px; margin-top: 12px; line-height: 1.5; }
   .mini-btn.flash { color: var(--good); border-color: var(--good); }
 </style>
 </head>
-<body class="d-compact">
+<body class="d-comfy">
 <header class="top">
   <h1>@TITLE@</h1>
   <span class="updated" id="updated">@UPDATED@ · llm-quota-watchdog</span>
 </header>
 <div id="summary" class="summary">@SUMMARY@</div>
 <div class="controls">
-  <a class="btn refresh-link" href="/refresh">刷新全部</a>
+  <a class="btn primary refresh-link" href="/refresh">刷新全部</a>
   <button class="btn" id="share-toggle" title="隐藏邮箱、时间戳等可识别信息，方便截图分享">隐私模式</button>
   <button class="btn" id="open-settings"><svg class="gear" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.3 3.3l1.4 1.4M11.3 11.3l1.4 1.4M3.3 12.7l1.4-1.4M11.3 4.7l1.4-1.4"/></svg>显示设置</button>
 </div>
@@ -872,6 +927,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="modal" id="settings" hidden>
   <div class="modal-box">
     <div class="modal-head"><b>显示设置</b><button class="mini-btn" id="set-close">关闭</button></div>
+    <div class="set-row"><span>主题</span><select id="set-theme">
+      <option value="auto">跟随系统</option><option value="dark">深色</option><option value="light">浅色</option>
+    </select></div>
     <div class="set-row"><span>密度</span><select id="set-density">
       <option value="comfy">舒适</option><option value="compact">紧凑</option><option value="mini">极简单行</option>
     </select></div>
@@ -912,7 +970,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
               ['pace','节奏提示与时间刻度'], ['fetched','更新时间'], ['expiry','套餐到期'],
               ['summary','顶部摘要']];
   function defaults(){
-    return {v: 1, density: 'compact', cols: 0, sort: 'custom', order: [], hidden: [],
+    return {v: 1, theme: 'auto', density: 'comfy', cols: 0, sort: 'custom', order: [], hidden: [],
             show: {badge: true, sub: true, reset: true, pace: true, fetched: true, expiry: true, summary: true},
             autoRefresh: 0};
   }
@@ -922,7 +980,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var raw = {};
     try { raw = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
     S = defaults();
-    ['density', 'cols', 'sort', 'autoRefresh'].forEach(function(k){
+    ['theme', 'density', 'cols', 'sort', 'autoRefresh'].forEach(function(k){
       if (raw[k] !== undefined) S[k] = raw[k];
     });
     if (Array.isArray(raw.order)) S.order = raw.order.slice();
@@ -959,8 +1017,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   function apply(){
     syncOrder();
     var b = document.body;
-    b.className = 'd-' + S.density;
-    SHOW.forEach(function(p){ if (!S.show[p[0]]) b.classList.add('hide-' + p[0]); });
+    // density + theme + detail toggles are all body classes; toggle each by
+    // name so we never clobber share-mode (which the toolbar button owns)
+    ['d-comfy', 'd-compact', 'd-mini'].forEach(function(c){ b.classList.remove(c); });
+    b.classList.add('d-' + S.density);
+    ['theme-dark', 'theme-light'].forEach(function(c){ b.classList.remove(c); });
+    if (S.theme === 'dark') b.classList.add('theme-dark');
+    else if (S.theme === 'light') b.classList.add('theme-light');
+    SHOW.forEach(function(p){ b.classList.toggle('hide-' + p[0], !S.show[p[0]]); });
     document.getElementById('cards').style.setProperty('--cols', S.cols ? String(S.cols) : 'auto-fill');
     cards().forEach(function(c){
       var n = acctOf(c);
@@ -1004,6 +1068,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
 
   function buildPanel(){
+    document.getElementById('set-theme').value = S.theme;
     document.getElementById('set-density').value = S.density;
     document.getElementById('set-cols').value = String(S.cols);
     document.getElementById('set-sort').value = S.sort;
@@ -1121,6 +1186,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       save(); apply(); buildPanel();
     };
   }
+  bindSelect('set-theme', 'theme', false);
   bindSelect('set-density', 'density', false);
   bindSelect('set-cols', 'cols', true);
   bindSelect('set-sort', 'sort', false);
@@ -1294,25 +1360,30 @@ def card_html(cfg, acct, entry, health):
             days = (exp_ts.date() - now_utc().astimezone(cfg["_tz"]).date()).days
             expiry_html = '<div class="expiry">套餐周期 %d 天后重置（%s）</div>' % (max(days, 0), exp)
 
+    # status dot always shows (colour carries the state); a text label only
+    # appears when something's wrong, so a healthy page is quiet dots not noise
     badge_html = ""
-    if health is not None and health != "ok":
-        # healthy is the common case: render a quiet dot, no text. Only problems
-        # earn a label, so a fully-healthy page isn't five green badges shouting
-        # over the numbers.
+    if health is not None:
         cls, htext = BADGE[health]
-        badge_html = '<span class="badge b-%s"><i class="dot"></i>%s</span>' % (cls, html.escape(htext))
+        label_txt = "" if health == "ok" else html.escape(htext)
+        badge_html = '<span class="badge b-%s"><i class="dot"></i>%s</span>' % (cls, label_txt)
+    # a window near its ceiling (or a bad token) tints the whole card so it
+    # stands out in a grid without re-reading every number
+    alert = (health in ("token_expired", "error")) or any(
+        (w.get("pct") is not None and w.get("pct") >= 75)
+        for w in (entry.get("windows") or {}).values())
     sub_html = ""
     if acct.get("sub"):
         sub_html = '<span class="plan">%s</span>' % html.escape(str(acct["sub"]))
     fetched = parse_ts(entry.get("fetched_at"))
     fetched_txt = ("更新于 " + fetched.astimezone(cfg["_tz"]).strftime("%H:%M")) if fetched else "尚未拉取"
     label_esc = html.escape(label)
-    return ('<div class="card" data-account="%s" data-health="%s">'
+    return ('<div class="card%s" data-account="%s" data-health="%s">'
             '<h2><span class="title"><span>%s</span>%s</span>'
             '<span class="card-actions">%s<a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a>'
             '</span></h2><div class="wins">%s</div>%s<div class="fetched">%s</div></div>'
-            % (label_esc, html.escape(health or ""), label_esc, sub_html, badge_html,
-               "/refresh?account=" + urllib.parse.quote(label), label_esc,
+            % (" alert" if alert else "", label_esc, html.escape(health or ""), label_esc, sub_html,
+               badge_html, "/refresh?account=" + urllib.parse.quote(label), label_esc,
                "".join(rows), expiry_html, html.escape(fetched_txt)))
 
 

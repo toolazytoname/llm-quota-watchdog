@@ -36,6 +36,7 @@ Two toolbar buttons:
 
 | What | Options |
 |---|---|
+| Theme | **follow system** / dark / light (auto day/night by your OS; or pin one) |
 | Density | comfortable / compact / **mini** (one row per account — always one screen, however many you have) |
 | Columns | auto / 1 / 2 / 3 / 4 |
 | Accounts | show or hide each one, reorder with ↑↓ |
