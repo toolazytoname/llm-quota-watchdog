@@ -12,6 +12,9 @@ Subcommands:
   watchdog             check quotas, push alerts only when rules trigger
   watchdog --summary   always push the full daily summary (plus any alerts)
   page                 generate a static HTML dashboard
+  page --account LBL   only re-query that account, serve the rest from the page
+                        cache (repeatable) — this is what the per-card refresh
+                        button on the dashboard is meant to call
   check-auth           optional: push when CLIProxyAPI auth-file health changes
                         (only does anything if cliproxyapi_management_key_file is
                         set in config; run this from its own low-frequency cron
@@ -26,16 +29,17 @@ import datetime
 import html
 import json
 import os
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
+    "bark_url_file": "",            # ...or keep the key out of config.json, in a chmod-600 file
     "ntfy_url": "",                 # e.g. https://ntfy.sh/your-topic (optional)
+    "ntfy_url_file": "",
     "cliproxyapi_auth_dir": "~/.cli-proxy-api",
     "cliproxyapi_management_key_file": "",   # optional: enables auth-file health checks
     "cliproxyapi_management_url": "http://127.0.0.1:8317/v0/management/auth-files",
@@ -46,8 +50,10 @@ DEFAULTS = {
     "thresholds": {},
     "timezone_offset_hours": 8,
     "state_file": "./quota-watchdog-state.json",
+    "page_state_file": "./quota-page-state.json",
     "page_out_dir": "./www",
     "log_file": "./quota-watchdog.log",
+    "page_title": "大模型额度监控",
 }
 
 THRESH = {
@@ -66,16 +72,36 @@ THRESH = {
 
 def load_config(path):
     cfg = dict(DEFAULTS)
+    user = {}
     if os.path.exists(path):
         with open(path) as f:
-            cfg.update(json.load(f))
+            user = json.load(f)
+        cfg.update(user)
     th = dict(THRESH)
     th.update(cfg.get("thresholds") or {})
     cfg["thresholds"] = th
+    # a config.json written before the page cache existed won't name one; keep it
+    # next to the alert state instead of in whatever directory cron started in
+    if "page_state_file" not in user:
+        cfg["page_state_file"] = os.path.join(
+            os.path.dirname(cfg["state_file"]) or ".", "quota-page-state.json")
     cfg["_tz"] = datetime.timezone(datetime.timedelta(hours=cfg["timezone_offset_hours"]))
-    for k in ("state_file", "page_out_dir", "log_file"):
+    for k in ("state_file", "page_state_file", "page_out_dir", "log_file"):
         cfg[k] = os.path.expanduser(cfg[k])
     return cfg
+
+
+def read_secret(cfg, inline_key, file_key):
+    """Config values that may be secrets can live inline or in a chmod-600 file;
+    the file wins when both are set."""
+    path = (cfg.get(file_key) or "").strip()
+    if path:
+        try:
+            with open(os.path.expanduser(path)) as f:
+                return f.read().strip()
+        except OSError as e:
+            log(cfg, "cannot read %s (%s): %s" % (file_key, path, e))
+    return (cfg.get(inline_key) or "").strip()
 
 
 def log(cfg, msg):
@@ -119,19 +145,46 @@ def fmt_pct(pct):
     return "?" if pct is None else ("%d%%" % round(pct))
 
 
-def load_state(cfg):
-    if os.path.exists(cfg["state_file"]):
+def load_json_file(path, default):
+    if os.path.exists(path):
         try:
-            with open(cfg["state_file"]) as f:
+            with open(path) as f:
                 return json.load(f)
         except Exception:
             pass
-    return {}
+    return default
+
+
+def save_json_file(path, data):
+    """Atomic write: the page state is touched by both the cron run and any
+    on-demand refresh trigger, and a half-written file would lose every
+    account's cached quota."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def load_state(cfg):
+    return load_json_file(cfg["state_file"], {})
 
 
 def save_state(cfg, state):
-    with open(cfg["state_file"], "w") as f:
-        json.dump(state, f)
+    save_json_file(cfg["state_file"], state)
+
+
+def load_page_state(cfg):
+    state = load_json_file(cfg["page_state_file"], {})
+    if not isinstance(state.get("accounts"), dict):
+        state["accounts"] = {}
+    return state
+
+
+def save_page_state(cfg, state):
+    save_json_file(cfg["page_state_file"], state)
 
 
 # ---------------------------------------------------------------- providers
@@ -250,63 +303,108 @@ def glm_quota(api_key):
     return out
 
 
-def collect(cfg):
-    """Discover accounts and query every provider. Returns {label: windows|{"error": msg}}.
+def classify_error(e):
+    """401/403 means the credential itself went bad, which deserves a louder
+    badge than a network blip that will fix itself."""
+    if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
+        return "token_expired"
+    return "error"
 
-    For auto-discovered CLIProxyAPI accounts, label is the auth filename without
-    the ".json" suffix — this lets cmd_page match it back against the
-    management-API health check (which reports filenames) without a second
-    directory scan.
+
+def account_list(cfg):
+    """Every account to show, in display order.
+
+    Explicitly configured accounts come first (config order — that's also the
+    page's default card order), then any CLIProxyAPI auth file not already
+    claimed by one of them. Claiming is matched on the auth filename, so
+    configuring one of your two Codex accounts by hand still auto-discovers the
+    other instead of silently dropping it.
     """
-    results = {}
+    accounts = []
+    claimed = set()
+    for acc in cfg.get("accounts") or []:
+        if acc.get("type") not in ("claude", "codex", "kimi", "glm"):
+            continue
+        entry = dict(acc)
+        entry["label"] = acc.get("label") or acc["type"]
+        if acc.get("auth_file"):
+            entry["auth_file"] = os.path.expanduser(acc["auth_file"])
+            claimed.add(os.path.basename(entry["auth_file"]))
+        accounts.append(entry)
 
-    # 1) auto-discover Claude/Codex OAuth files from the CLIProxyAPI auth dir
     auth_dir = os.path.expanduser(cfg.get("cliproxyapi_auth_dir") or "")
     if auth_dir and os.path.isdir(auth_dir):
         for fn in sorted(os.listdir(auth_dir)):
-            if not fn.endswith(".json"):
+            if not fn.endswith(".json") or fn in claimed:
                 continue
             path = os.path.join(auth_dir, fn)
             try:
                 with open(path) as f:
                     head = json.load(f)
-                ptype = head.get("type")
-                if ptype not in ("claude", "codex") or head.get("disabled"):
-                    continue
-                label = fn[:-5]  # strip .json
-                results[label] = (claude_quota if ptype == "claude" else codex_quota)(path)
             except Exception as e:
-                results[fn[:-5]] = {"error": str(e)[:120]}
+                log(cfg, "skipping unreadable auth file %s: %s" % (fn, e))
+                continue
+            if head.get("type") not in ("claude", "codex") or head.get("disabled"):
+                continue
+            # label defaults to the filename minus .json; set an explicit
+            # account entry in config.json if you want a prettier card title
+            accounts.append({"type": head["type"], "label": fn[:-5], "auth_file": path})
+    return accounts
 
-    # 2) manual accounts (kimi, or explicit claude/codex with custom labels)
-    for acc in cfg.get("accounts") or []:
-        label = acc.get("label") or acc.get("type", "?")
-        try:
-            t = acc.get("type")
-            if t in ("kimi", "glm"):
-                key = acc.get("api_key") or ""
-                if not key and acc.get("api_key_file"):
-                    kf = os.path.expanduser(acc["api_key_file"])
-                    if os.path.exists(kf):
-                        with open(kf) as f:
-                            key = f.read().strip()
-                if not key:
-                    continue  # no key configured -> skip silently (no error card)
-                fn = kimi_quota if t == "kimi" else glm_quota
-                results[label] = fn(key)
-            elif t in ("claude", "codex") and acc.get("auth_file"):
-                fn = claude_quota if t == "claude" else codex_quota
-                results[label] = fn(os.path.expanduser(acc["auth_file"]))
-        except Exception as e:
-            results[label] = {"error": str(e)[:120]}
+
+def fetch_one(cfg, acct):
+    """Query one account's quota. Never raises — a dead account comes back as
+    {"error": ..., "error_kind": ...} so it can't blank out everyone else's card.
+    Returns None when the account isn't usable at all (no key configured)."""
+    t = acct.get("type")
+    try:
+        if t in ("kimi", "glm"):
+            key = acct.get("api_key") or ""
+            if not key and acct.get("api_key_file"):
+                kf = os.path.expanduser(acct["api_key_file"])
+                if os.path.exists(kf):
+                    with open(kf) as f:
+                        key = f.read().strip()
+            if not key:
+                return None  # no key configured -> skip silently (no error card)
+            windows = (kimi_quota if t == "kimi" else glm_quota)(key)
+        elif t in ("claude", "codex") and acct.get("auth_file"):
+            fn = claude_quota if t == "claude" else codex_quota
+            windows = fn(os.path.expanduser(acct["auth_file"]))
+        else:
+            return None
+    except Exception as e:
+        return {"error": str(e)[:160], "error_kind": classify_error(e)}
+    if not windows:
+        # GLM at least answers 200 with an error body when the key is bad. Taking
+        # that as success would replace real numbers with a blank green card, so
+        # "no windows at all" counts as a failed fetch and the cache is kept.
+        return {"error": "响应里没有任何额度窗口（key 失效或接口有变？）", "error_kind": "error"}
+    return {"windows": windows}
+
+
+def collect(cfg):
+    """Query every account live. Returns {label: windows|{"error": msg}}.
+
+    This is the watchdog's path on purpose: alerts have to fire on fresh numbers,
+    and it only runs hourly. The page reads its own cache instead (see cmd_page)
+    so that clicking refresh on one card doesn't re-poll every provider.
+    """
+    results = {}
+    for acct in account_list(cfg):
+        r = fetch_one(cfg, acct)
+        if r is None:
+            continue
+        results[acct["label"]] = r["windows"] if "windows" in r else {"error": r["error"]}
     return results
+
 
 
 # ---------------------------------------------------------------- push
 
 def push(cfg, title, body):
     sent = False
-    bark = (cfg.get("bark_url") or "").strip().rstrip("/")
+    bark = read_secret(cfg, "bark_url", "bark_url_file").rstrip("/")
     if bark:
         url = (bark + "/" + urllib.parse.quote(title, safe="") + "/"
                + urllib.parse.quote(body, safe="") + "?group=QuotaWatchdog")
@@ -315,7 +413,7 @@ def push(cfg, title, body):
             sent = True
         except Exception as e:
             log(cfg, "bark error: " + str(e))
-    ntfy = (cfg.get("ntfy_url") or "").strip()
+    ntfy = read_secret(cfg, "ntfy_url", "ntfy_url_file")
     if ntfy:
         try:
             req = urllib.request.Request(
@@ -548,21 +646,28 @@ def cmd_check_auth(cfg):
 
 # ---------------------------------------------------------------- page
 
+def reset_left(ts):
+    """Just the countdown ("2小时后"). Rendered into a data attribute too, so the
+    page's summary line can quote it without re-parsing the full string."""
+    if ts is None:
+        return ""
+    delta = ts - now_utc()
+    hours = delta.total_seconds() / 3600
+    if hours < 0:
+        return "即将重置"
+    if hours < 1:
+        return "%d分钟后" % round(delta.total_seconds() / 60)
+    if hours < 24:
+        return "%d小时后" % round(hours)
+    return "%d天后" % round(hours / 24)
+
+
 def fmt_reset_page(cfg, ts):
     if ts is None:
         return "重置时间未知"
     bj = ts.astimezone(cfg["_tz"])
-    delta = ts - now_utc()
-    hours = delta.total_seconds() / 3600
-    if hours < 0:
-        left = "即将重置"
-    elif hours < 1:
-        left = "%d分钟后" % round(delta.total_seconds() / 60)
-    elif hours < 24:
-        left = "%d小时后" % round(hours)
-    else:
-        left = "%d天后" % round(hours / 24)
-    return "%d月%d日 %02d:%02d 重置（%s）" % (bj.month, bj.day, bj.hour, bj.minute, left)
+    return "%d月%d日 %02d:%02d 重置（%s）" % (bj.month, bj.day, bj.hour, bj.minute, reset_left(ts))
+
 
 
 def bar_color(pct):
@@ -576,26 +681,36 @@ def bar_color(pct):
 
 
 def window_html(cfg, label, pct, reset, note="", elapsed=None):
+    """One quota bar. data-pct / data-short / data-reset-short are read by the
+    page's summary line, which recomputes "who's most at risk" from whatever
+    cards are currently visible. The title attribute keeps the reset time and
+    pace reachable in the mini density, which hides both to stay one row tall."""
     pct_txt = "未知" if pct is None else ("%.2f%%" % pct if pct < 10 else "%.1f%%" % pct)
     width = 0 if pct is None else max(min(pct, 100), 0.5)
     marker_html = ""
     if elapsed is not None:
         marker_html = '<div class="time-marker" style="left:%.1f%%"></div>' % max(min(elapsed, 100), 0)
-    note_html = '<div class="note">%s</div>' % html.escape(note) if note else ""
+    note_html = '<span class="note">%s</span>' % html.escape(note) if note else ""
+    reset_txt = fmt_reset_page(cfg, reset)
     return """
-    <div class="win">
+    <div class="win" data-pct="%s" data-short="%s" data-reset-short="%s" title="%s">
       <div class="win-head"><span>%s</span><span class="pct" style="color:%s">%s</span></div>
       <div class="bar"><div class="fill" style="width:%.1f%%;background:%s"></div>%s</div>
-      <div class="reset">%s</div>
-      %s
-    </div>""" % (html.escape(label), bar_color(pct), pct_txt, width, bar_color(pct), marker_html,
-                 html.escape(fmt_reset_page(cfg, reset)), note_html)
+      <div class="meta"><span class="reset">%s</span>%s</div>
+    </div>""" % ("" if pct is None else "%.1f" % pct, html.escape(label),
+                 html.escape(reset_left(reset)),
+                 html.escape("%s · %s%s" % (label, reset_txt, " · " + note if note else "")),
+                 html.escape(label), bar_color(pct), pct_txt,
+                 width, bar_color(pct), marker_html,
+                 html.escape(reset_txt), note_html)
+
 
 
 BADGE = {
     "ok": ("🟢", "正常"),
     "token_expired": ("🔴", "Token 异常"),
     "error": ("🟡", "查询异常"),
+    "unknown": ("⚪", "未知"),
 }
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -603,66 +718,298 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>额度监控</title>
+<title>@TITLE@</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 16px; max-width: 720px; margin: 0 auto; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 16px; max-width: 1440px; margin: 0 auto; }
   h1 { font-size: 20px; margin-bottom: 4px; }
   .updated { color: #7d8590; font-size: 12px; margin-bottom: 10px; }
-  .banner { font-size: 13px; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; background: #161b22; border: 1px solid #30363d; color: #3fb950; }
-  .banner.bad { color: #e5534b; border-color: #e5534b; }
-  .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; font-size: 13px; }
-  .btn, .mini-btn { display: inline-block; background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; text-decoration: none; font-size: 12px; }
+  .summary { font-size: 13px; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; background: #161b22; border: 1px solid #30363d; color: #3fb950; }
+  .summary.warn { color: #d4a72c; border-color: #d4a72c; }
+  .summary.bad { color: #e5534b; border-color: #e5534b; }
+  .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; font-size: 13px; flex-wrap: wrap; }
+  .btn, .mini-btn { display: inline-block; background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; text-decoration: none; font-size: 12px; cursor: pointer; font-family: inherit; }
   .btn:hover, .mini-btn:hover { background: #30363d; }
-  .controls select { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 3px 6px; font-size: 12px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
-  .card h2 { font-size: 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
-  .card-actions { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: normal; }
+  select, textarea { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 3px 6px; font-size: 12px; font-family: inherit; }
+
+  #cards { display: grid; grid-template-columns: repeat(var(--cols, auto-fill), minmax(300px, 1fr)); gap: 14px; align-items: start; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; }
+  .card.hidden { display: none; }
+  .card h2 { font-size: 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-weight: 600; }
+  .title { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+  .title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plan { color: #7d8590; font-size: 11px; font-weight: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-actions { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: normal; white-space: nowrap; }
   .badge { color: #7d8590; }
   .win { margin-bottom: 14px; }
   .win:last-child { margin-bottom: 0; }
-  .win-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+  .win-head { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; margin-bottom: 5px; }
   .pct { font-weight: 600; }
   .bar { position: relative; background: #30363d; border-radius: 6px; height: 10px; overflow: hidden; }
   .fill { height: 100%; border-radius: 6px; transition: width .3s; }
   .time-marker { position: absolute; top: 0; bottom: 0; width: 2px; background: #e6edf3; opacity: .85; }
-  .reset { color: #7d8590; font-size: 12px; margin-top: 5px; }
-  .note { color: #7d8590; font-size: 11px; margin-top: 3px; font-style: italic; }
+  .meta { margin-top: 5px; }
+  .reset { color: #7d8590; font-size: 12px; display: block; }
+  .note { color: #7d8590; font-size: 11px; font-style: italic; display: block; margin-top: 3px; }
   .err { color: #e5534b; font-size: 13px; }
   .expiry { color: #d4a72c; font-size: 12px; margin-top: 10px; }
+  .fetched { color: #6e7681; font-size: 11px; margin-top: 10px; }
+
+  /* density: compact (default) — same information, less air */
+  body.d-compact .card { padding: 12px; }
+  body.d-compact .card h2 { margin-bottom: 9px; font-size: 15px; }
+  body.d-compact .win { margin-bottom: 10px; }
+  body.d-compact .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+  body.d-compact .reset, body.d-compact .note { font-size: 11px; margin-top: 0; display: inline; }
+  body.d-compact .note::before { content: "· "; }
+  body.d-compact .fetched, body.d-compact .expiry { margin-top: 7px; }
+
+  /* density: mini — one row per account, everything but the bars stripped */
+  body.d-mini #cards { grid-template-columns: 1fr; gap: 6px; }
+  body.d-mini .card { display: flex; align-items: center; gap: 14px; padding: 8px 12px; }
+  body.d-mini .card h2 { display: contents; }
+  body.d-mini .title { flex: 0 0 clamp(110px, 18vw, 200px); font-size: 14px; }
+  body.d-mini .card-actions { order: 9; }
+  /* fixed columns so the same window lines up down the whole page: 5h left,
+     weekly right, and the (rare, manual) monthly snapshot on its own row */
+  body.d-mini .wins { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; min-width: 0; }
+  body.d-mini .win { margin-bottom: 0; }
+  body.d-mini .win[data-short="5小时"] { grid-column: 1; }
+  body.d-mini .win[data-short="7天"] { grid-column: 2; }
+  body.d-mini .win[data-short="月度"] { grid-column: 1; }
+  body.d-mini .win-head { font-size: 12px; margin-bottom: 3px; }
+  body.d-mini .bar { height: 8px; }
+  body.d-mini .meta, body.d-mini .expiry, body.d-mini .fetched, body.d-mini .plan { display: none; }
+
+  /* per-item visibility toggles from the settings panel */
+  body.hide-badge .badge { display: none; }
+  body.hide-sub .plan { display: none; }
+  body.hide-reset .reset { display: none; }
+  body.hide-pace .note, body.hide-pace .time-marker { display: none; }
+  body.hide-fetched .fetched { display: none; }
+  body.hide-expiry .expiry { display: none; }
+  body.hide-summary #summary { display: none; }
+
+  /* settings panel */
+  .modal { position: fixed; inset: 0; background: rgba(1,4,9,.7); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal[hidden] { display: none; }
+  .modal-box { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 16px; width: 420px; max-width: 100%; max-height: 85vh; overflow: auto; font-size: 13px; }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .set-row select { min-width: 150px; }
+  .set-sec { color: #7d8590; font-size: 12px; margin: 14px 0 6px; border-top: 1px solid #30363d; padding-top: 10px; }
+  .set-acct { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; }
+  .set-acct label { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .set-acct button { padding: 1px 8px; }
+  .set-acct button[disabled] { opacity: .35; cursor: default; }
+  #set-show label { display: flex; align-items: center; gap: 6px; padding: 3px 0; }
+  #set-json { width: 100%; margin-top: 6px; font-size: 11px; }
+  .set-btns { display: flex; gap: 8px; margin-top: 8px; }
+  .set-hint { color: #6e7681; font-size: 11px; margin-top: 8px; }
 </style>
 </head>
-<body>
-<h1>📊 大模型额度监控</h1>
+<body class="d-compact">
+<h1>📊 @TITLE@</h1>
 <div class="updated" id="updated">数据更新于 @UPDATED@ · llm-quota-watchdog</div>
-<div id="banner-wrap">@BANNER@</div>
+<div id="summary" class="summary">@SUMMARY@</div>
 <div class="controls">
   <a class="btn refresh-link" href="/refresh">🔄 全部刷新</a>
-  <label>自动刷新
-    <select id="auto-refresh" onchange="setAutoRefresh(this.value)">
-      <option value="0">关闭</option>
-      <option value="300">5分钟</option>
-      <option value="900">15分钟</option>
-      <option value="1800">30分钟</option>
-      <option value="3600">1小时</option>
-      <option value="10800">3小时</option>
-    </select>
-  </label>
+  <button class="btn" id="open-settings">⚙️ 设置</button>
 </div>
 <div id="cards">@CARDS@</div>
+
+<div class="modal" id="settings" hidden>
+  <div class="modal-box">
+    <div class="modal-head"><b>显示设置</b><button class="mini-btn" id="set-close">关闭</button></div>
+    <div class="set-row"><span>密度</span><select id="set-density">
+      <option value="comfy">舒适</option><option value="compact">紧凑</option><option value="mini">极简单行</option>
+    </select></div>
+    <div class="set-row"><span>列数</span><select id="set-cols">
+      <option value="0">自动</option><option value="1">1 列</option><option value="2">2 列</option>
+      <option value="3">3 列</option><option value="4">4 列</option>
+    </select></div>
+    <div class="set-row"><span>排序</span><select id="set-sort">
+      <option value="custom">自定义顺序</option><option value="usage">按用量高低（告急置顶）</option>
+    </select></div>
+    <div class="set-row"><span>自动刷新</span><select id="set-refresh">
+      <option value="0">关闭</option><option value="300">5分钟</option><option value="900">15分钟</option>
+      <option value="1800">30分钟</option><option value="3600">1小时</option><option value="10800">3小时</option>
+    </select></div>
+    <div class="set-sec">显示哪些账号 · 调整顺序</div>
+    <div id="set-accounts"></div>
+    <div class="set-sec">显示哪些内容</div>
+    <div id="set-show"></div>
+    <div class="set-sec">备份与重置</div>
+    <textarea id="set-json" rows="3" placeholder="点“导出”把设置复制走，或粘贴一段设置后点“导入”"></textarea>
+    <div class="set-btns">
+      <button class="mini-btn" id="set-export">导出</button>
+      <button class="mini-btn" id="set-import">导入</button>
+      <button class="mini-btn" id="set-reset">恢复默认</button>
+    </div>
+    <div class="set-hint">设置只存在这个浏览器里（localStorage），不会上传，也不影响别人看到的页面。</div>
+  </div>
+</div>
+
 <script>
 (function(){
-  var sel = document.getElementById('auto-refresh');
-  var saved = localStorage.getItem('quotaAutoRefresh') || '0';
-  sel.value = saved;
-  var timer = null;
+  var KEY = 'quotaSettings';
+  var SHOW = [['badge','健康徽章'], ['sub','卡片副标题'], ['reset','重置时间'],
+              ['pace','节奏提示与时间刻度'], ['fetched','更新时间'], ['expiry','套餐到期'],
+              ['summary','顶部摘要']];
+  function defaults(){
+    return {v: 1, density: 'compact', cols: 0, sort: 'custom', order: [], hidden: [],
+            show: {badge: true, sub: true, reset: true, pace: true, fetched: true, expiry: true, summary: true},
+            autoRefresh: 0};
+  }
+  var S = defaults(), timer = null;
+
+  function load(){
+    var raw = {};
+    try { raw = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
+    S = defaults();
+    ['density', 'cols', 'sort', 'autoRefresh'].forEach(function(k){
+      if (raw[k] !== undefined) S[k] = raw[k];
+    });
+    if (Array.isArray(raw.order)) S.order = raw.order.slice();
+    if (Array.isArray(raw.hidden)) S.hidden = raw.hidden.slice();
+    if (raw.show) SHOW.forEach(function(p){
+      if (raw.show[p[0]] !== undefined) S.show[p[0]] = !!raw.show[p[0]];
+    });
+    // versions before the settings panel kept the interval in its own key
+    var legacy = localStorage.getItem('quotaAutoRefresh');
+    if (legacy !== null && raw.autoRefresh === undefined) S.autoRefresh = parseInt(legacy, 10) || 0;
+  }
+  function save(){ try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
+
+  function cards(){ return [].slice.call(document.querySelectorAll('#cards .card')); }
+  function acctOf(c){ return c.getAttribute('data-account'); }
+  function maxPct(card){
+    var m = -1;
+    [].forEach.call(card.querySelectorAll('.win'), function(w){
+      var p = parseFloat(w.getAttribute('data-pct'));
+      if (!isNaN(p) && p > m) m = p;
+    });
+    return m;
+  }
+
+  // keep order/hidden in sync with whatever accounts the page actually has:
+  // new ones land at the end and start visible, vanished ones are dropped
+  function syncOrder(){
+    var names = cards().map(acctOf);
+    S.order = S.order.filter(function(n){ return names.indexOf(n) >= 0; });
+    names.forEach(function(n){ if (S.order.indexOf(n) < 0) S.order.push(n); });
+    S.hidden = S.hidden.filter(function(n){ return names.indexOf(n) >= 0; });
+  }
+
+  function apply(){
+    syncOrder();
+    var b = document.body;
+    b.className = 'd-' + S.density;
+    SHOW.forEach(function(p){ if (!S.show[p[0]]) b.classList.add('hide-' + p[0]); });
+    document.getElementById('cards').style.setProperty('--cols', S.cols ? String(S.cols) : 'auto-fill');
+    cards().forEach(function(c){
+      var n = acctOf(c);
+      c.classList.toggle('hidden', S.hidden.indexOf(n) >= 0);
+      // grid order, so reordering never touches the DOM the refresh patches
+      c.style.order = (S.sort === 'usage') ? Math.round(1000 - maxPct(c)) : S.order.indexOf(n);
+    });
+    renderSummary();
+    arm(S.autoRefresh);
+  }
+
+  // summary is computed from the *visible* cards, so hiding an account also
+  // stops it from being reported as the one you should worry about
+  function renderSummary(){
+    var el = document.getElementById('summary');
+    if (!el) return;
+    var vis = cards().filter(function(c){ return !c.classList.contains('hidden'); });
+    if (!vis.length) { el.textContent = '没有显示中的账号 · 去 ⚙️ 设置里打开几个'; el.className = 'summary'; return; }
+    var ok = 0, unknown = 0, bad = [], worst = null;
+    vis.forEach(function(c){
+      var h = c.getAttribute('data-health') || '';
+      if (h === 'ok') ok++;
+      else if (h === 'unknown') unknown++;
+      else if (h) bad.push(acctOf(c));
+      [].forEach.call(c.querySelectorAll('.win'), function(w){
+        var p = parseFloat(w.getAttribute('data-pct'));
+        if (isNaN(p)) return;
+        if (!worst || p > worst.pct) worst = {pct: p, acct: acctOf(c),
+          win: w.getAttribute('data-short') || '', reset: w.getAttribute('data-reset-short') || ''};
+      });
+    });
+    var parts = [];
+    if (bad.length) parts.push('⚠️ ' + bad.join('、') + ' 异常');
+    else if (ok) parts.push('✅ ' + ok + '/' + vis.length + ' 正常');
+    else if (unknown) parts.push('⚪ 健康检查暂不可用');
+    if (worst) parts.push('最紧张：' + worst.acct + ' ' + worst.win + ' ' + Math.round(worst.pct) + '%'
+                          + (worst.reset ? '（' + worst.reset + '重置）' : ''));
+    el.textContent = parts.join(' · ') || '—';
+    // an account sitting at 90% is worth noticing even when every token is healthy
+    el.className = 'summary' + (bad.length ? ' bad' : (worst && worst.pct >= 85 ? ' warn' : ''));
+  }
+
+  function buildPanel(){
+    document.getElementById('set-density').value = S.density;
+    document.getElementById('set-cols').value = String(S.cols);
+    document.getElementById('set-sort').value = S.sort;
+    document.getElementById('set-refresh').value = String(S.autoRefresh);
+
+    var box = document.getElementById('set-accounts');
+    box.innerHTML = '';
+    S.order.forEach(function(n, i){
+      var row = document.createElement('div');
+      row.className = 'set-acct';
+      var lab = document.createElement('label');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = S.hidden.indexOf(n) < 0;
+      cb.onchange = function(){
+        var at = S.hidden.indexOf(n);
+        if (cb.checked) { if (at >= 0) S.hidden.splice(at, 1); }
+        else if (at < 0) S.hidden.push(n);
+        save(); apply();
+      };
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(n));
+      row.appendChild(lab);
+      var btns = document.createElement('span');
+      [['↑', -1, i === 0], ['↓', 1, i === S.order.length - 1]].forEach(function(spec){
+        var b = document.createElement('button');
+        b.className = 'mini-btn';
+        b.textContent = spec[0];
+        // manual order is meaningless while sorting by usage
+        b.disabled = spec[2] || S.sort === 'usage';
+        b.onclick = function(){
+          var j = i + spec[1];
+          var t = S.order[i]; S.order[i] = S.order[j]; S.order[j] = t;
+          save(); apply(); buildPanel();
+        };
+        btns.appendChild(b);
+      });
+      row.appendChild(btns);
+      box.appendChild(row);
+    });
+
+    var showBox = document.getElementById('set-show');
+    showBox.innerHTML = '';
+    SHOW.forEach(function(p){
+      var lab = document.createElement('label');
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!S.show[p[0]];
+      cb.onchange = function(){ S.show[p[0]] = cb.checked; save(); apply(); };
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(p[1]));
+      showBox.appendChild(lab);
+    });
+  }
 
   function patchFromHtml(htmlText, account){
     var doc = new DOMParser().parseFromString(htmlText, 'text/html');
     var upd = doc.getElementById('updated');
-    var ban = doc.getElementById('banner-wrap');
+    var sum = doc.getElementById('summary');
     if (upd) document.getElementById('updated').innerHTML = upd.innerHTML;
-    if (ban) document.getElementById('banner-wrap').innerHTML = ban.innerHTML;
+    if (sum) document.getElementById('summary').innerHTML = sum.innerHTML;
     if (account) {
       var sel2 = '[data-account="' + CSS.escape(account) + '"]';
       var newCard = doc.querySelector(sel2);
@@ -673,6 +1020,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       var oldCards = document.getElementById('cards');
       if (newCards && oldCards) oldCards.innerHTML = newCards.innerHTML;
     }
+    apply();      // the patch just replaced the nodes we had styled
+    buildPanel(); // ...and may have added or removed an account
   }
 
   function doRefresh(url, account){
@@ -704,105 +1053,207 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       }, v * 1000);
     }
   }
-  arm(saved);
 
-  window.setAutoRefresh = function(v){
-    localStorage.setItem('quotaAutoRefresh', v);
-    arm(v);
+  var modal = document.getElementById('settings');
+  document.getElementById('open-settings').onclick = function(){ buildPanel(); modal.hidden = false; };
+  document.getElementById('set-close').onclick = function(){ modal.hidden = true; };
+  modal.onclick = function(e){ if (e.target === modal) modal.hidden = true; };
+  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') modal.hidden = true; });
+
+  function bindSelect(id, key, asInt){
+    document.getElementById(id).onchange = function(){
+      S[key] = asInt ? (parseInt(this.value, 10) || 0) : this.value;
+      save(); apply(); buildPanel();
+    };
+  }
+  bindSelect('set-density', 'density', false);
+  bindSelect('set-cols', 'cols', true);
+  bindSelect('set-sort', 'sort', false);
+  bindSelect('set-refresh', 'autoRefresh', true);
+
+  document.getElementById('set-export').onclick = function(){
+    var ta = document.getElementById('set-json');
+    ta.value = JSON.stringify(S);
+    ta.select();
   };
+  document.getElementById('set-import').onclick = function(){
+    var ta = document.getElementById('set-json');
+    try { localStorage.setItem(KEY, JSON.stringify(JSON.parse(ta.value))); }
+    catch (e) { ta.value = '这段设置解析不了：' + e.message; return; }
+    load(); apply(); buildPanel();
+    ta.value = '已导入 ✓';
+  };
+  document.getElementById('set-reset').onclick = function(){
+    S = defaults();
+    localStorage.removeItem('quotaAutoRefresh');
+    save(); apply(); buildPanel();
+  };
+
+  load();
+  apply();
 })();
 </script>
 </body>
 </html>"""
-# NOTE: "全部刷新" / per-card refresh links and the auto-refresh dropdown are
-# pure frontend — they just fetch() /refresh (optionally ?account=<label>) and
-# patch the DOM in place (falling back to a full navigation if fetch fails).
-# This script does not ship a server for that endpoint; if you don't run one,
-# the buttons simply 404 and the static page itself is unaffected. See the
-# README for a minimal example of such a refresh trigger.
+# NOTE: "全部刷新" / per-card refresh links are pure frontend — they just fetch()
+# /refresh (optionally ?account=<label>) and patch the DOM in place (falling back
+# to a full navigation if fetch fails). This script does not ship a server for
+# that endpoint; if you don't run one, the buttons simply 404 and the static page
+# itself is unaffected. See the README for a minimal example of such a trigger.
+# The settings panel is frontend-only too: it lives in localStorage, so every
+# visitor gets their own layout without the generator knowing anything about it.
 
 
-def cmd_page(cfg):
-    results = collect(cfg)
+def refresh_page_state(cfg, page_state, accounts, labels=None):
+    """Re-query accounts (all of them unless labels is given) into page_state.
+
+    A failed fetch keeps whatever numbers we had — a card that goes blank every
+    time the network hiccups is worse than a card showing slightly stale data
+    next to a red badge.
+    """
+    stamp = now_utc().isoformat()
+    for acct in accounts:
+        label = acct["label"]
+        if labels is not None and label not in labels:
+            continue
+        r = fetch_one(cfg, acct)
+        if r is None:
+            continue
+        entry = dict(page_state["accounts"].get(label) or {})
+        entry["fetched_at"] = stamp
+        if "windows" in r:
+            entry["windows"] = dict(
+                (win, {"pct": pct, "reset": (reset.isoformat() if reset else None)})
+                for win, (pct, reset) in r["windows"].items())
+            entry["fetch_error"] = None
+            entry["last_ok_at"] = stamp
+            entry["health"] = "ok"
+        else:
+            entry["fetch_error"] = r["error"]
+            entry["health"] = r["error_kind"]
+        page_state["accounts"][label] = entry
+
+
+def resolve_health(cfg, acct, entry, bad_set):
+    """Which badge a card gets, or None for no badge at all.
+
+    OAuth accounts defer to CLIProxyAPI's management API when it's available —
+    it knows about refresh failures that a successful usage call wouldn't show.
+    If that check was asked for but couldn't run, we say ⚪未知 rather than
+    claiming all-clear. People who don't run CLIProxyAPI never configure the
+    management key, so they just get the verdict of our own last fetch.
+    """
+    own = entry.get("health")
+    if acct["type"] in ("claude", "codex"):
+        if bad_set is not None and os.path.basename(acct.get("auth_file") or "") in bad_set:
+            return "token_expired"
+        if own == "ok" and bad_set is None and cfg.get("cliproxyapi_management_key_file"):
+            return "unknown"
+    return own or "unknown"
+
+
+def card_html(cfg, acct, entry, health):
+    label = acct["label"]
+    rows = []
+    windows = entry.get("windows") or {}
+    for win in ("5h", "7d"):
+        w = windows.get(win)
+        if not w:
+            continue
+        pct, reset = w.get("pct"), parse_ts(w.get("reset"))
+        pi = pace_info(pct, reset, win)
+        note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
+        rows.append(window_html(cfg, "5小时" if win == "5h" else "7天", pct, reset, note,
+                                elapsed=(pi[0] if pi else None)))
+    # optional manual monthly snapshot, shown last (widest time span)
+    snap = (cfg.get("monthly_snapshot") or {}).get(label)
+    if snap:
+        reset_ts = parse_ts(str(snap.get("reset")) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
+        pi = monthly_pace(snap.get("pct"), reset_ts)
+        note = "手动更新于 %s" % snap.get("updated", "?")
+        if pi:
+            note += " · 时间进度 %.0f%% · 节奏%s" % pi
+        rows.append(window_html(cfg, "月度", snap.get("pct"), reset_ts, note,
+                                elapsed=(pi[0] if pi else None)))
+    if entry.get("fetch_error"):
+        # shown alongside stale bars when we have them, alone when we don't
+        rows.append('<div class="err">查询失败: %s</div>'
+                    % html.escape(str(entry["fetch_error"])[:80]))
+    if not rows:
+        rows.append('<div class="err">尚无数据，等待首次刷新</div>')
+
+    expiry_html = ""
+    exp = (cfg.get("plan_expiry") or {}).get(label)
+    if exp:
+        exp_ts = parse_ts(str(exp) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
+        if exp_ts:
+            days = (exp_ts.date() - now_utc().astimezone(cfg["_tz"]).date()).days
+            expiry_html = '<div class="expiry">📅 套餐周期 %d 天后重置（%s）</div>' % (max(days, 0), exp)
+
+    badge_html = ""
+    if health is not None:
+        dot, htext = BADGE[health]
+        badge_html = '<span class="badge">%s %s</span>' % (dot, html.escape(htext))
+    sub_html = ""
+    if acct.get("sub"):
+        sub_html = '<span class="plan">%s</span>' % html.escape(str(acct["sub"]))
+    fetched = parse_ts(entry.get("fetched_at"))
+    fetched_txt = ("更新于 " + fetched.astimezone(cfg["_tz"]).strftime("%H:%M")) if fetched else "尚未拉取"
+    label_esc = html.escape(label)
+    return ('<div class="card" data-account="%s" data-health="%s">'
+            '<h2><span class="title"><span>%s</span>%s</span>'
+            '<span class="card-actions">%s<a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a>'
+            '</span></h2><div class="wins">%s</div>%s<div class="fetched">%s</div></div>'
+            % (label_esc, html.escape(health or ""), label_esc, sub_html, badge_html,
+               "/refresh?account=" + urllib.parse.quote(label), label_esc,
+               "".join(rows), expiry_html, html.escape(fetched_txt)))
+
+
+def render_page(cfg, page_state, accounts):
+    """Build the HTML from cached state only — no network calls except the local
+    management-API health check."""
     bad_set = auth_health_map(cfg)
+    cards, unhealthy, healthy = [], [], 0
+    for acct in accounts:
+        entry = page_state["accounts"].get(acct["label"]) or {}
+        health = resolve_health(cfg, acct, entry, bad_set)
+        if health == "ok":
+            healthy += 1
+        elif health != "unknown":
+            unhealthy.append(acct["label"])
+        cards.append(card_html(cfg, acct, entry, health))
 
-    cards = []
-    unhealthy = []
-    healthy = 0
-    for name, q in results.items():
-        if bad_set is not None and (name + ".json") in bad_set:
-            health = "token_expired"
-        elif "error" in q:
-            health = "error"
-        elif bad_set is None:
-            health = None
-        else:
-            health = "ok"
-        if health is not None:
-            if health == "ok":
-                healthy += 1
-            else:
-                unhealthy.append(name)
-
-        rows = []
-        if "error" in q:
-            rows.append('<div class="err">查询失败: %s</div>' % html.escape(str(q["error"])[:80]))
-        else:
-            for win in ("5h", "7d"):
-                if win not in q:
-                    continue
-                pct, reset = q[win]
-                pi = pace_info(pct, reset, win)
-                note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
-                rows.append(window_html(cfg, "5小时用量" if win == "5h" else "7天用量", pct, reset, note,
-                                         elapsed=(pi[0] if pi else None)))
-            # optional manual monthly snapshot, shown last (widest time span)
-            snap = (cfg.get("monthly_snapshot") or {}).get(name)
-            if snap:
-                reset_ts = parse_ts(str(snap.get("reset")) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
-                pi = monthly_pace(snap.get("pct"), reset_ts)
-                note = "手动更新于 %s" % snap.get("updated", "?")
-                if pi:
-                    note += " · 时间进度 %.0f%% · 节奏%s" % pi
-                rows.append(window_html(cfg, "月度总配额", snap.get("pct"), reset_ts, note,
-                                         elapsed=(pi[0] if pi else None)))
-        expiry_html = ""
-        exp = (cfg.get("plan_expiry") or {}).get(name)
-        if exp:
-            exp_ts = parse_ts(str(exp) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
-            if exp_ts:
-                days = (exp_ts.date() - now_utc().astimezone(cfg["_tz"]).date()).days
-                expiry_html = '<div class="expiry">📅 套餐周期 %d 天后重置（%s）</div>' % (max(days, 0), exp)
-
-        badge_html = ""
-        if health is not None:
-            dot, htext = BADGE[health]
-            badge_html = '<span class="badge">%s %s</span>' % (dot, html.escape(htext))
-        refresh_link = "/refresh?account=" + urllib.parse.quote(name)
-        name_esc = html.escape(name)
-        cards.append(
-            '<div class="card" data-account="%s"><h2><span>%s</span><span class="card-actions">%s'
-            '<a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a></span></h2>%s%s</div>'
-            % (name_esc, name_esc, badge_html, refresh_link, name_esc, "".join(rows), expiry_html))
-
+    # server-rendered fallback; the page's script recomputes this from whichever
+    # cards the visitor actually kept visible
     if unhealthy:
-        banner_html = '<div class="banner bad">⚠️ %s 异常，其余正常</div>' % html.escape("、".join(unhealthy))
-    elif bad_set is not None:
-        banner_html = '<div class="banner">✅ %d/%d 账号正常</div>' % (healthy, len(results))
+        summary = "⚠️ %s 异常，其余正常" % "、".join(unhealthy)
+    elif healthy:
+        summary = "✅ %d/%d 正常" % (healthy, len(accounts))
     else:
-        banner_html = ""
+        summary = "⚪ 健康检查暂不可用"
+
+    return (PAGE_TEMPLATE
+            .replace("@TITLE@", html.escape(cfg.get("page_title") or DEFAULTS["page_title"]))
+            .replace("@UPDATED@", now_utc().astimezone(cfg["_tz"]).strftime("%m月%d日 %H:%M"))
+            .replace("@SUMMARY@", html.escape(summary))
+            .replace("@CARDS@", "".join(cards)))
+
+
+def cmd_page(cfg, labels=None):
+    accounts = account_list(cfg)
+    page_state = load_page_state(cfg)
+    refresh_page_state(cfg, page_state, accounts, labels)
+    save_page_state(cfg, page_state)
 
     out_dir = cfg["page_out_dir"]
     os.makedirs(out_dir, exist_ok=True)
-    page = (PAGE_TEMPLATE
-            .replace("@UPDATED@", now_utc().astimezone(cfg["_tz"]).strftime("%m月%d日 %H:%M"))
-            .replace("@BANNER@", banner_html)
-            .replace("@CARDS@", "".join(cards)))
     tmp = os.path.join(out_dir, ".index.html.tmp")
     with open(tmp, "w") as f:
-        f.write(page)
+        f.write(render_page(cfg, page_state, accounts))
     os.replace(tmp, os.path.join(out_dir, "index.html"))
-    log(cfg, "page generated: " + os.path.join(out_dir, "index.html"))
+    log(cfg, "page generated: %s (refreshed: %s)"
+        % (os.path.join(out_dir, "index.html"), ",".join(labels) if labels else "all"))
+
 
 
 # ---------------------------------------------------------------- main
@@ -811,6 +1262,9 @@ def main():
     ap = argparse.ArgumentParser(description="llm-quota-watchdog: LLM coding-plan quota dashboard + alerts")
     ap.add_argument("command", choices=["watchdog", "page", "check-auth"])
     ap.add_argument("--summary", action="store_true", help="watchdog: always push the full summary")
+    ap.add_argument("--account", action="append", metavar="LABEL",
+                    help="page: only re-query this account (repeatable); "
+                         "everything else is served from the page cache")
     ap.add_argument("--config", default=os.environ.get("QUOTA_WATCHDOG_CONFIG", "./config.json"))
     ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     args = ap.parse_args()
@@ -819,7 +1273,7 @@ def main():
     if args.command == "watchdog":
         cmd_watchdog(cfg, args.summary)
     elif args.command == "page":
-        cmd_page(cfg)
+        cmd_page(cfg, args.account)
     else:
         cmd_check_auth(cfg)
 

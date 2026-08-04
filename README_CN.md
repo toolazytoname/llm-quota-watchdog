@@ -23,11 +23,29 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 
 ### 额度仪表盘（静态 HTML，cron 定时生成）
 
-每个账号：5 小时 / 每周 / 月度（手动快照）进度条、精确百分比、柱状图上的时间进度刻度线、重置倒计时、用量 vs 时间节奏（偏快/偏慢）、套餐到期倒计时。深色主题，手机友好。
+每个账号：5 小时 / 每周 / 月度（手动快照）进度条、精确百分比、柱状图上的时间进度刻度线、重置倒计时、用量 vs 时间节奏（偏快/偏慢）、套餐到期倒计时。深色主题，自适应多列网格，账号再多也尽量一屏装下。
 
-页面上还有"全部刷新"按钮、每张卡片自己的刷新链接、以及自动刷新间隔下拉框。这些都是纯前端链接，指向 `/refresh`（可带 `?account=<label>`）——本仓库不附带这个端点的服务端实现，不接的话按钮点了就是 404，不影响页面本身。想接的话见下文[「可选：按需刷新」](#可选按需刷新)。
+顶部一行摘要直接告诉你现在该关心谁：`✅ 5/5 正常 · 最紧张：Codex Pro 7天 100%（4天后重置）`，有账号逼近上限时整条变黄。
 
 ![dashboard](docs/screenshot.png)
+
+页面右上角的 **⚙️ 设置**（纯前端，存在浏览器 localStorage 里，不影响别人看到的页面，也不需要任何后端）：
+
+| 能调什么 | 选项 |
+|---|---|
+| 密度 | 舒适 / 紧凑 / **极简单行**（每个账号压成一行，几个账号都绝对一屏） |
+| 列数 | 自动 / 1 / 2 / 3 / 4 |
+| 账号 | 逐个显示或隐藏、↑↓ 调整顺序 |
+| 排序 | 自定义顺序 / 按用量高低（告急自动置顶） |
+| 显示内容 | 健康徽章、卡片副标题、重置时间、节奏提示、更新时间、套餐到期、顶部摘要，逐项开关 |
+| 自动刷新 | 关闭 / 5 分钟 ~ 3 小时 |
+| 备份 | 设置导出/导入 JSON、一键恢复默认 |
+
+![极简密度](docs/screenshot-mini.png)
+
+> 想截图分享又不想露邮箱？把「卡片副标题」关掉即可。
+
+页面上还有"全部刷新"按钮和每张卡片自己的刷新链接。这些都是纯前端链接，指向 `/refresh`（可带 `?account=<label>`）——本仓库不附带这个端点的服务端实现，不接的话按钮点了就是 404，不影响页面本身。想接的话见下文[「可选：按需刷新」](#可选按需刷新)。
 
 ### 推送告警（Bark / ntfy）
 
@@ -116,19 +134,34 @@ location /quota/ {
 | 配置 | 说明 |
 |---|---|
 | `bark_url` / `ntfy_url` | 推送通道，可配任一或都配 |
+| `bark_url_file` / `ntfy_url_file` | 同上，但从文件读（key 不落进 config.json），配了文件就以文件为准 |
+| `page_title` | 页面标题，默认「大模型额度监控」 |
 | `cliproxyapi_auth_dir` | CLIProxyAPI 的 OAuth `*.json` 目录，Claude/Codex 自动发现 |
-| `accounts` | 手动账号，如 Kimi / GLM（`api_key` 或 `api_key_file`），或自定义标签的 Claude/Codex |
+| `accounts` | 显式账号列表，也决定卡片默认顺序。每项可配 `label`（卡片标题）、`sub`（副标题，如邮箱或套餐档位）、`api_key`/`api_key_file`（Kimi/GLM）或 `auth_file`（Claude/Codex） |
 | `relaxed_accounts` | 只保留"快用完"告警的账号标签 |
-| `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → 页面倒计时 + 到期提醒 |
-| `monthly_snapshot` | 手动维护的月度配额快照，显示在页面上 |
+| `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → 页面倒计时 + 到期提醒（key 用账号 label） |
+| `monthly_snapshot` | 手动维护的月度配额快照，显示在页面上（key 用账号 label） |
 | `thresholds` | 所有告警阈值都可调 |
 | `timezone_offset_hours` | 显示/报告时区（默认 UTC+8） |
+| `page_state_file` | 页面缓存：存每个账号最后一次拉取的结果，`page --account` 靠它只刷一个账号 |
 | `cliproxyapi_management_key_file` | 可选，配置后解锁认证文件健康徽章 + `check-auth`（见上文） |
 | `cliproxyapi_management_url` | CLIProxyAPI 管理 API 地址，默认 `http://127.0.0.1:8317/v0/management/auth-files` |
 
+`accounts` 留空也能跑：Claude/Codex 会从 `cliproxyapi_auth_dir` 自动发现，卡片标题就是认证文件名。想要好看的标题和副标题，再显式写进 `accounts` 即可——显式配过的认证文件不会被重复自动发现，所以两个 Codex 账号只写一个也不会漏掉另一个。
+
+## 部分刷新
+
+`page` 默认重新拉取所有账号。加上 `--account`（可重复）则只重新拉取指定账号，其余直接用 `page_state_file` 里的缓存渲染：
+
+```bash
+llm-quota-watchdog page --account "Kimi Coding" --account "GLM Coding"
+```
+
+顺带还有两个好处：某个账号拉取失败时，卡片保留上次的数字并标红，而不是变成空白；每张卡片会显示自己的"更新于 HH:MM"。
+
 ## 可选：按需刷新
 
-页面上的刷新按钮只是指向 `/refresh` / `/refresh?account=<label>` 的链接，具体接什么服务端自己定。给个最小示例：一个只监听本地的小 HTTP 服务，收到请求就重新跑一遍 `page`（可选只刷某个账号），跑完 302 跳回首页，套一层跟主站相同的 basic auth 反代出去，不裸露公网：
+页面上的刷新按钮只是指向 `/refresh` / `/refresh?account=<label>` 的链接，具体接什么服务端自己定。给个最小示例：一个只监听本地的小 HTTP 服务，收到请求就重新跑一遍 `page`（带 `--account` 时只刷那个账号），跑完 302 跳回首页，套一层跟主站相同的 basic auth 反代出去，不裸露公网：
 
 ```python
 # refresh_server.py —— 只监听 127.0.0.1
@@ -139,7 +172,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         account = (qs.get("account") or [None])[0]
         cmd = ["llm-quota-watchdog", "page"]
-        subprocess.run(cmd, timeout=60)  # page 目前是整体重新生成
+        if account:
+            cmd += ["--account", account]   # 只重新拉这个账号，其余用缓存
+        subprocess.run(cmd, timeout=60)
         self.send_response(302); self.send_header("Location", "/"); self.end_headers()
 
 with socketserver.ThreadingTCPServer(("127.0.0.1", 8791), Handler) as httpd:

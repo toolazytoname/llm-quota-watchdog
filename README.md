@@ -23,11 +23,29 @@ llm-quota-watchdog polls the same endpoints the official CLIs use, renders a sin
 
 ### Dashboard (static HTML, regenerate on cron)
 
-Per account: 5-hour / weekly / monthly (manual snapshot) progress bars with exact percentages, a time-progress marker on each bar, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. Dark, mobile-friendly.
+Per account: 5-hour / weekly / monthly (manual snapshot) progress bars with exact percentages, a time-progress marker on each bar, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. Dark theme, responsive multi-column grid that keeps even a long account list on one screen.
 
-The page also has a "refresh all" button, a per-account refresh link, and an auto-refresh interval dropdown. These are plain links to `/refresh` (optionally `?account=<label>`) — this repo doesn't ship a server for that endpoint, so if you don't wire one up the buttons just 404 and the static page itself is unaffected. See [Optional: on-demand refresh](#optional-on-demand-refresh) below for a minimal example.
+A one-line summary at the top tells you who to worry about right now: `✅ 5/5 healthy · tightest: Codex Pro weekly 100% (resets in 4d)`. It turns amber when an account is close to its ceiling.
 
 ![dashboard](docs/screenshot.png)
+
+The **⚙️ settings** panel is pure frontend — it lives in the visitor's `localStorage`, needs no backend, and doesn't change what anyone else sees:
+
+| What | Options |
+|---|---|
+| Density | comfortable / compact / **mini** (one row per account — always one screen, however many you have) |
+| Columns | auto / 1 / 2 / 3 / 4 |
+| Accounts | show or hide each one, reorder with ↑↓ |
+| Sorting | custom order / by usage (most-burnt first) |
+| Details | health badge, card subtitle, reset time, pace hint, fetch time, plan expiry, top summary — each toggleable |
+| Auto refresh | off / 5 min – 3 h |
+| Backup | export/import settings as JSON, reset to defaults |
+
+![mini density](docs/screenshot-mini.png)
+
+> Sharing a screenshot but don't want your email in it? Turn off "card subtitle".
+
+The page also has a "refresh all" button and a per-account refresh link. These are plain links to `/refresh` (optionally `?account=<label>`) — this repo doesn't ship a server for that endpoint, so if you don't wire one up the buttons just 404 and the static page itself is unaffected. See [Optional: on-demand refresh](#optional-on-demand-refresh) below for a minimal example.
 
 ### Push alerts (Bark / ntfy)
 
@@ -125,19 +143,34 @@ See [config.example.json](config.example.json) — every key has a sane default.
 | Key | Meaning |
 |---|---|
 | `bark_url` / `ntfy_url` | push channel(s); either, both, or none |
+| `bark_url_file` / `ntfy_url_file` | same, but read from a file so the key stays out of config.json; the file wins if both are set |
+| `page_title` | dashboard heading (default: 大模型额度监控) |
 | `cliproxyapi_auth_dir` | directory with CLIProxyAPI OAuth `*.json` files; Claude/Codex auto-discovered |
-| `accounts` | manual accounts, e.g. Kimi / GLM (`api_key` or `api_key_file`), or explicitly-labelled Claude/Codex |
+| `accounts` | explicit account list; also the default card order. Each entry takes `label` (card title), `sub` (subtitle, e.g. the email or plan tier), `api_key`/`api_key_file` (Kimi/GLM) or `auth_file` (Claude/Codex) |
 | `relaxed_accounts` | labels that only get the "nearly used up" alert |
-| `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → countdown on page + expiry alerts |
-| `monthly_snapshot` | manually-maintained monthly quota shown on the page |
+| `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → countdown on page + expiry alerts (keyed by account label) |
+| `monthly_snapshot` | manually-maintained monthly quota shown on the page (keyed by account label) |
 | `thresholds` | every alert threshold is tunable |
 | `timezone_offset_hours` | display/report timezone (default UTC+8) |
+| `page_state_file` | page cache holding each account's last fetch; what makes `page --account` able to refresh just one |
 | `cliproxyapi_management_key_file` | optional; enables auth-file health badges + `check-auth` (see above) |
 | `cliproxyapi_management_url` | CLIProxyAPI management API URL, default `http://127.0.0.1:8317/v0/management/auth-files` |
 
+Leaving `accounts` empty still works: Claude/Codex are auto-discovered from `cliproxyapi_auth_dir` and each card is titled after its auth filename. Add entries to `accounts` when you want nicer titles and subtitles — an auth file you configured explicitly is not auto-discovered a second time, so listing one of your two Codex accounts by hand won't drop the other.
+
+## Partial refresh
+
+`page` re-queries every account by default. With `--account` (repeatable) it re-queries only those, rendering the rest from `page_state_file`:
+
+```bash
+llm-quota-watchdog page --account "Kimi Coding" --account "GLM Coding"
+```
+
+Two side benefits of that cache: when one account's fetch fails its card keeps the previous numbers and goes red instead of blank, and every card shows its own "updated HH:MM".
+
 ## Optional: on-demand refresh
 
-The dashboard's refresh buttons just link to `/refresh` / `/refresh?account=<label>` — wire up whatever you like behind that path. A minimal example: a tiny local HTTP server that reruns `page` (optionally scoped to one account) and 302s back, proxied through your existing web server under the same auth so the endpoint isn't public:
+The dashboard's refresh buttons just link to `/refresh` / `/refresh?account=<label>` — wire up whatever you like behind that path. A minimal example: a tiny local HTTP server that reruns `page` (scoped to one account when asked) and 302s back, proxied through your existing web server under the same auth so the endpoint isn't public:
 
 ```python
 # refresh_server.py — listens on 127.0.0.1 only
@@ -148,7 +181,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         account = (qs.get("account") or [None])[0]
         cmd = ["llm-quota-watchdog", "page"]
-        subprocess.run(cmd, timeout=60)  # page always regenerates every account currently in state
+        if account:
+            cmd += ["--account", account]   # re-query just this one, cache for the rest
+        subprocess.run(cmd, timeout=60)
         self.send_response(302); self.send_header("Location", "/"); self.end_headers()
 
 with socketserver.ThreadingTCPServer(("127.0.0.1", 8791), Handler) as httpd:

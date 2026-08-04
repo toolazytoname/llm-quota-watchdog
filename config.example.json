@@ -1,18 +1,29 @@
 {
   "bark_url": "https://api.day.app/YOUR_BARK_KEY/",
+  "bark_url_file": "",
   "ntfy_url": "",
+  "ntfy_url_file": "",
+  "page_title": "大模型额度监控",
   "cliproxyapi_auth_dir": "~/.cli-proxy-api",
   "cliproxyapi_management_key_file": "",
   "cliproxyapi_management_url": "http://127.0.0.1:8317/v0/management/auth-files",
   "accounts": [
     {
+      "type": "claude",
+      "label": "Claude Pro",
+      "sub": "you@example.com",
+      "auth_file": "~/.cli-proxy-api/claude-you@example.com.json"
+    },
+    {
       "type": "kimi",
       "label": "Kimi Coding",
+      "sub": "最高档套餐",
       "api_key_file": "~/.config/llm-quota-watchdog/kimi-key"
     },
     {
       "type": "glm",
       "label": "GLM Coding",
+      "sub": "Pro",
       "api_key_file": "~/.config/llm-quota-watchdog/glm-key"
     }
   ],
@@ -36,6 +47,7 @@
   },
   "timezone_offset_hours": 8,
   "state_file": "~/.local/share/llm-quota-watchdog/quota-watchdog-state.json",
+  "page_state_file": "~/.local/share/llm-quota-watchdog/quota-page-state.json",
   "page_out_dir": "~/.local/share/llm-quota-watchdog/www",
   "log_file": "~/.local/share/llm-quota-watchdog/quota-watchdog.log"
 }
