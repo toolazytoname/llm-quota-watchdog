@@ -90,7 +90,7 @@ The tool calls the exact endpoints the official CLIs use:
 
 If you run [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), just point `cliproxyapi_auth_dir` at its auth dir — every Claude/Codex account is picked up automatically, no extra config.
 
-> Kimi's **monthly overall quota** (the one in the web console, mixing Kimi chat + Code) is not exposed by any API. The dashboard supports a manually-updated snapshot for it (`monthly_snapshot`).
+> Kimi's **monthly overall quota** (the one in the web console, mixing Kimi chat + Code) has no documented API of its own, but the web console calls an internal RPC (`kimi.com/apiv2/.../GetSubscription`) authenticated with a browser-login token instead of the coding API key. If you configure `monthly_web_token_file` for a Kimi account, the dashboard auto-refreshes this number on every `watchdog` run and alerts when it's nearly used up — see [Kimi monthly quota token](#kimi-monthly-quota-token) below. Without that token it falls back to a manually-updated snapshot (`monthly_snapshot`).
 
 ## Quickstart
 
@@ -156,7 +156,7 @@ See [config.example.json](config.example.json) — every key has a sane default.
 | `accounts` | explicit account list; also the default card order. Each entry takes `label` (card title), `sub` (subtitle, e.g. the email or plan tier), `api_key`/`api_key_file` (Kimi/GLM) or `auth_file` (Claude/Codex) |
 | `relaxed_accounts` | labels that only get the "nearly used up" alert |
 | `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → countdown on page + expiry alerts (keyed by account label) |
-| `monthly_snapshot` | manually-maintained monthly quota shown on the page (keyed by account label) |
+| `monthly_snapshot` | monthly quota shown on the page (keyed by account label); manually-maintained unless the account has `monthly_web_token_file`, in which case it's auto-refreshed (see [Kimi monthly quota token](#kimi-monthly-quota-token)) |
 | `thresholds` | every alert threshold is tunable |
 | `timezone_offset_hours` | display/report timezone (default UTC+8) |
 | `page_state_file` | page cache holding each account's last fetch; what makes `page --account` able to refresh just one |
@@ -188,6 +188,26 @@ There's no web form for this, and there won't be — API keys are credentials, n
    ```
 4. **Rotating a key** is the same two steps: overwrite the file in place (step 1) and re-run `page`; no config.json change needed since the filename didn't change.
 5. **Removing an account**: delete its `accounts` entry and its key file. Also drop any references to its old label in `relaxed_accounts` / `plan_expiry` / `monthly_snapshot`, since those are matched by label string.
+
+## Kimi monthly quota token
+
+Kimi's coding-plan API key only returns the 5h/7d rolling window — the monthly total shown on the web console (`kimi.com/membership/subscription?tab=quota`) needs a separate browser-login token, since it comes from an internal RPC rather than the documented API.
+
+1. Log into kimi.com in a browser, open devtools → Network, and reload the quota page. Find the `GetSubscription` request and copy its `Authorization: Bearer <token>` header value (just the token, not the `Bearer ` prefix).
+2. Save it to its own file, same rules as an API key (own file, `chmod 600`, never inline in `config.json`):
+   ```bash
+   cat > .kimi-web-token <<'EOF'
+   <paste the token here>
+   EOF
+   chmod 600 .kimi-web-token
+   ```
+3. Add `monthly_web_token_file` to the Kimi account entry in `config.json`:
+   ```json
+   {"type": "kimi", "label": "Kimi Coding", "api_key_file": ".kimi-key", "monthly_web_token_file": ".kimi-web-token"}
+   ```
+4. Run `watchdog` once by hand to confirm it picks up the real percentage (check the log, or the account's `monthly_snapshot` note on the page — it'll say "自动更新于 <date>" instead of "手动更新于").
+
+This token is a normal browser session token, so it expires (in practice, several months). When it does, every `watchdog` run fails to refresh the monthly number and you'll get a one-time **【Token失效】** alert asking you to repeat step 1. Until you do, the dashboard keeps showing the last successfully-fetched number — it does not silently reset to 0% or blank the card, and it does not affect the 5h/7d windows (those still refresh normally on the API key).
 
 ## Partial refresh
 

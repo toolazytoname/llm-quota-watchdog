@@ -90,7 +90,7 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 
 如果你在用 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)，把 `cliproxyapi_auth_dir` 指向它的认证目录即可，所有 Claude/Codex 账号自动接入，零配置。
 
-> Kimi 的**月度总配额**（网页控制台里混算 Kimi 聊天 + Code 的那个）没有任何 API 能拿，页面支持手动快照（`monthly_snapshot`）。
+> Kimi 的**月度总配额**（网页控制台里混算 Kimi 聊天 + Code 的那个）没有文档化的 API，但网页控制台本身调用了一个内部 RPC（`kimi.com/apiv2/.../GetSubscription`），鉴权用的是网页登录态 token 而不是 coding API key。给 Kimi 账号配置 `monthly_web_token_file` 后，仪表盘会在每次 `watchdog` 运行时自动刷新这个数字，快用完时还会告警——见下文[Kimi 月度配额 token](#kimi-月度配额-token)。不配的话就退化成手动维护快照（`monthly_snapshot`）。
 
 ## 快速开始
 
@@ -147,7 +147,7 @@ location /quota/ {
 | `accounts` | 显式账号列表，也决定卡片默认顺序。每项可配 `label`（卡片标题）、`sub`（副标题，如邮箱或套餐档位）、`api_key`/`api_key_file`（Kimi/GLM）或 `auth_file`（Claude/Codex） |
 | `relaxed_accounts` | 只保留"快用完"告警的账号标签 |
 | `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → 页面倒计时 + 到期提醒（key 用账号 label） |
-| `monthly_snapshot` | 手动维护的月度配额快照，显示在页面上（key 用账号 label） |
+| `monthly_snapshot` | 月度配额快照，显示在页面上（key 用账号 label）；没配 `monthly_web_token_file` 的账号需手动维护，配了的会自动刷新 |
 | `thresholds` | 所有告警阈值都可调 |
 | `timezone_offset_hours` | 显示/报告时区（默认 UTC+8） |
 | `page_state_file` | 页面缓存：存每个账号最后一次拉取的结果，`page --account` 靠它只刷一个账号 |
@@ -179,6 +179,26 @@ location /quota/ {
    ```
 4. **换 key**：同样两步——原地覆盖 key 文件（第 1 步）再跑一次 `page`；文件名没变的话 `config.json` 不用动。
 5. **删账号**：删掉 `accounts` 里对应项和它的 key 文件，同时检查 `relaxed_accounts` / `plan_expiry` / `monthly_snapshot` 里有没有引用它的旧 label（这几处都是按 label 字符串匹配的，改名后要一起改）。
+
+## Kimi 月度配额 token
+
+Kimi 的 coding-plan API key 只能拿到 5h/7d 滚动窗口——网页控制台（`kimi.com/membership/subscription?tab=quota`）上那个月度总量，走的是一个内部 RPC，鉴权用另一套网页登录 token，不是 API key。
+
+1. 浏览器登录 kimi.com，打开开发者工具 → Network，刷新配额页面，找到 `GetSubscription` 这个请求，复制它的 `Authorization: Bearer <token>` 请求头里的 token（只要 token 本身，不带 `Bearer ` 前缀）。
+2. 单独存成一个文件，规则跟 API key 一样（单独文件、`chmod 600`、绝不写进 `config.json`）：
+   ```bash
+   cat > .kimi-web-token <<'EOF'
+   <把 token 粘贴到这里>
+   EOF
+   chmod 600 .kimi-web-token
+   ```
+3. 在 `config.json` 里给 Kimi 账号加 `monthly_web_token_file`：
+   ```json
+   {"type": "kimi", "label": "Kimi Coding", "api_key_file": ".kimi-key", "monthly_web_token_file": ".kimi-web-token"}
+   ```
+4. 手动跑一次 `watchdog` 确认拿到了真实百分比（看日志，或者页面上这个账号的 `monthly_snapshot` 那行会显示"自动更新于 <日期>"而不是"手动更新于"）。
+
+这个 token 是普通的浏览器会话 token，会过期（实测能撑好几个月）。过期后每次 `watchdog` 都会刷新失败，你会收到一次性的**【Token失效】**告警，提示重复第 1 步。在你更新之前，页面会保留上次成功抓到的数字，不会静默清零或把卡片弄坏——也不影响 5h/7d 窗口（那部分走 API key，照常刷新）。
 
 ## 部分刷新
 

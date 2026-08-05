@@ -18,7 +18,8 @@
       "type": "kimi",
       "label": "Kimi Coding",
       "sub": "最高档套餐",
-      "api_key_file": "~/.config/llm-quota-watchdog/kimi-key"
+      "api_key_file": "~/.config/llm-quota-watchdog/kimi-key",
+      "monthly_web_token_file": "~/.config/llm-quota-watchdog/kimi-web-token"
     },
     {
       "type": "glm",
@@ -37,6 +38,7 @@
   "thresholds": {
     "high_5h": 80,
     "high_week": 90,
+    "high_month": 60,
     "fast_margin": 15,
     "waste_mid_elapsed": 50,
     "waste_margin": 30,

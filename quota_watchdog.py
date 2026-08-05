@@ -47,6 +47,7 @@ DEFAULTS = {
     "relaxed_accounts": [],         # labels that only get nearly-used-up alerts
     "plan_expiry": {},              # {"Kimi Coding": "2026-08-22"}
     "monthly_snapshot": {},         # {"Kimi Coding": {"pct": 21.4, "reset": "2026-08-22", "updated": "2026-07-29"}}
+    "monthly_live_file": "./quota-monthly-live.json",  # auto-refreshed monthly snapshots (see refresh_monthly_from_web); merged over monthly_snapshot at load time, never written back to config.json
     "thresholds": {},
     "timezone_offset_hours": 8,
     "state_file": "./quota-watchdog-state.json",
@@ -65,6 +66,7 @@ THRESH = {
     "waste_hours_left": 26,         # near-reset waste: reset within this many hours
     "waste_pct": 60,                # ...and usage <= this %
     "refill_drop": 30,              # refill detection: drop of this many points
+    "high_month": 60,               # nearly-used-up: auto-refreshed monthly quota %
     "expiry_alert_days": [7, 3, 1],
 }
 
@@ -85,9 +87,16 @@ def load_config(path):
     if "page_state_file" not in user:
         cfg["page_state_file"] = os.path.join(
             os.path.dirname(cfg["state_file"]) or ".", "quota-page-state.json")
+    if "monthly_live_file" not in user:
+        cfg["monthly_live_file"] = os.path.join(
+            os.path.dirname(cfg["state_file"]) or ".", "quota-monthly-live.json")
     cfg["_tz"] = datetime.timezone(datetime.timedelta(hours=cfg["timezone_offset_hours"]))
-    for k in ("state_file", "page_state_file", "page_out_dir", "log_file"):
+    for k in ("state_file", "page_state_file", "page_out_dir", "log_file", "monthly_live_file"):
         cfg[k] = os.path.expanduser(cfg[k])
+    # auto-refreshed monthly snapshots (see refresh_monthly_from_web) take priority
+    # over the manually-typed-in ones with the same label
+    cfg["monthly_snapshot"] = dict(cfg.get("monthly_snapshot") or {})
+    cfg["monthly_snapshot"].update(load_json_file(cfg["monthly_live_file"], {}))
     return cfg
 
 
@@ -127,6 +136,12 @@ def parse_ts(s):
 
 def http_get(url, headers):
     req = urllib.request.Request(url, headers=headers)
+    return json.load(urllib.request.urlopen(req, timeout=20))
+
+
+def http_post_json(url, headers, body):
+    req = urllib.request.Request(url, headers=headers, method="POST",
+                                  data=json.dumps(body).encode())
     return json.load(urllib.request.urlopen(req, timeout=20))
 
 
@@ -246,6 +261,24 @@ def kimi_quota(api_key):
         if win.get("duration") == 300 and win.get("timeUnit") == "TIME_UNIT_MINUTE":
             out["5h"] = (pct_of(det), parse_ts(det.get("resetTime")))
     return out
+
+
+def kimi_monthly_quota(web_token):
+    """Kimi's coding-plan usage API (kimi_quota above) has no monthly-total
+    field — only a 5h/7d rolling window. The actual monthly quota only shows
+    up on the web console, behind a browser-login JWT instead of the coding
+    API key, via the GetSubscription RPC. Raises on any failure (network,
+    expired token, unexpected shape) so the caller can tell "no monthly data"
+    apart from "token needs replacing"."""
+    r = http_post_json(
+        "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription",
+        {"Authorization": "Bearer " + web_token, "Content-Type": "application/json"},
+        {})
+    balances = r.get("balances") or []
+    sub = next((b for b in balances if b.get("type") == "SUBSCRIPTION"), None) or balances[0]
+    pct = float(sub["amountUsedRatio"]) * 100
+    reset = parse_ts(sub.get("expireTime"))
+    return pct, reset
 
 
 def glm_quota(api_key):
@@ -478,12 +511,71 @@ def fmt_reset_short(cfg, ts):
     return "（重置 %d/%d %02d:%02d）" % (bj.month, bj.day, bj.hour, bj.minute)
 
 
+def refresh_monthly_from_web(cfg, state):
+    """Auto-refresh monthly quota for accounts with monthly_web_token_file
+    (currently just Kimi — see kimi_monthly_quota), independent of the 5h/7d
+    windows pipeline in cmd_watchdog: auth here is a separate web-login token,
+    and a stale/expired token shouldn't blank out that account's whole card,
+    just its monthly row. Returns a list of alert strings; mutates state and
+    writes cfg["monthly_live_file"] as a side effect."""
+    alerts = []
+    th = cfg["thresholds"]
+    live = dict(load_json_file(cfg["monthly_live_file"], {}))
+    today = now_utc().astimezone(cfg["_tz"]).date().isoformat()
+
+    for acct in cfg.get("accounts") or []:
+        tok_file = acct.get("monthly_web_token_file")
+        if not tok_file:
+            continue
+        label = acct.get("label") or acct["type"]
+        errkey = "monthly_token_error|" + label
+        try:
+            with open(os.path.expanduser(tok_file)) as f:
+                token = f.read().strip()
+            pct, reset = kimi_monthly_quota(token)
+        except Exception as e:
+            if not state.get(errkey):
+                alerts.append("【Token失效】%s 网页月度额度 token 已失效（%s），"
+                               "请重新登录 kimi.com 换取新 token" % (label, str(e)[:120]))
+                state[errkey] = True
+            continue
+        state.pop(errkey, None)
+
+        live[label] = {"pct": round(pct, 2),
+                        "reset": reset.date().isoformat() if reset else None,
+                        "updated": today, "source": "auto"}
+
+        key = "monthly_high|" + label
+        if pct >= th["high_month"] and not state.get(key):
+            eta = ""
+            if reset is not None:
+                days = (reset - now_utc()).total_seconds() / 86400
+                if days > 0:
+                    eta = "，%.1f 天后重置" % days
+            alerts.append("【快用完】%s 月度额度已用 %s（≥%d%%）%s"
+                           % (label, fmt_pct(pct), th["high_month"], eta))
+            state[key] = True
+        elif pct < th["high_month"] - 15:
+            state.pop(key, None)
+
+        pkey = "monthly_prev|" + label
+        prev = state.get(pkey)
+        state[pkey] = pct
+        if prev is not None and prev - pct >= th["refill_drop"]:
+            alerts.append("【满血复活】%s 月度额度已重置，当前已用 %s" % (label, fmt_pct(pct)))
+
+    save_json_file(cfg["monthly_live_file"], live)
+    cfg["monthly_snapshot"].update(live)
+    return alerts
+
+
 def cmd_watchdog(cfg, summary_mode):
     th = cfg["thresholds"]
     results = collect(cfg)
 
     state = load_state(cfg)
     alerts = []
+    alerts.extend(refresh_monthly_from_web(cfg, state))
     now = now_utc()
     today = now.astimezone(cfg["_tz"]).date().isoformat()
     relaxed = set(cfg.get("relaxed_accounts") or [])
@@ -1335,12 +1427,13 @@ def card_html(cfg, acct, entry, health):
         note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
         rows.append(window_html(cfg, "5小时" if win == "5h" else "7天", pct, reset, note,
                                 elapsed=(pi[0] if pi else None)))
-    # optional manual monthly snapshot, shown last (widest time span)
+    # optional monthly snapshot (manual entry, or auto-refreshed via
+    # refresh_monthly_from_web), shown last (widest time span)
     snap = (cfg.get("monthly_snapshot") or {}).get(label)
     if snap:
         reset_ts = parse_ts(str(snap.get("reset")) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
         pi = monthly_pace(snap.get("pct"), reset_ts)
-        note = "手动更新于 %s" % snap.get("updated", "?")
+        note = ("自动更新于 %s" if snap.get("source") == "auto" else "手动更新于 %s") % snap.get("updated", "?")
         if pi:
             note += " · 时间进度 %.0f%% · 节奏%s" % pi
         rows.append(window_html(cfg, "月度", snap.get("pct"), reset_ts, note,
