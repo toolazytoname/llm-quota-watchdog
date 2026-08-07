@@ -118,6 +118,18 @@ class QuotaScaleTests(unittest.TestCase):
         self.assertIn('class="drag-handle"', rendered)
         self.assertIn('aria-label="拖动账号调整顺序"', rendered)
 
+    def test_saved_order_migrates_to_provider_grouping_once(self):
+        self.assertIn("return {v: 3", q.PAGE_TEMPLATE)
+        self.assertIn("orderCustomized: false", q.PAGE_TEMPLATE)
+        self.assertIn("if (!S.orderCustomized)", q.PAGE_TEMPLATE)
+        self.assertIn("S.order = names.slice()", q.PAGE_TEMPLATE)
+        self.assertIn("S.orderCustomized = true", q.PAGE_TEMPLATE)
+
+    def test_pointer_drag_does_not_capture_a_disabled_target(self):
+        self.assertIn(".card.dragging { opacity: .45; pointer-events: none; }", q.PAGE_TEMPLATE)
+        self.assertNotIn("setPointerCapture", q.PAGE_TEMPLATE)
+        self.assertIn("window.addEventListener('blur', function(){ finishDrag(); })", q.PAGE_TEMPLATE)
+
 
 if __name__ == "__main__":
     unittest.main()

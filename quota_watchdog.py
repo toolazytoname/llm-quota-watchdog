@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
@@ -995,7 +995,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .drag-handle { color: var(--ink-3); cursor: grab; font-size: 10px; font-weight: 500; padding: 7px 3px; touch-action: none; user-select: none; }
   .drag-handle:active { cursor: grabbing; }
   .drag-handle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-  .card.dragging { opacity: .45; }
+  .card.dragging { opacity: .45; pointer-events: none; }
+  body.is-dragging, body.is-dragging * { cursor: grabbing !important; }
   .card.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
   .card.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
   .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--ink-2); font-weight: 500; }
@@ -1175,7 +1176,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
               ['pace','节奏提示与时间刻度'], ['fetched','更新时间'], ['expiry','套餐到期'],
               ['summary','顶部摘要']];
   function defaults(){
-    return {v: 2, theme: 'auto', density: 'comfy', sort: 'custom', order: [], hidden: [],
+    return {v: 3, theme: 'auto', density: 'comfy', sort: 'custom', order: [], orderCustomized: false, hidden: [],
             show: {badge: true, sub: true, reset: true, capacity: true, pace: true, fetched: true, expiry: true, summary: true},
             autoRefresh: 0};
   }
@@ -1188,7 +1189,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     ['theme', 'density', 'sort', 'autoRefresh'].forEach(function(k){
       if (raw[k] !== undefined) S[k] = raw[k];
     });
-    if (Array.isArray(raw.order)) S.order = raw.order.slice();
+    // v3 intentionally resets the old saved order once. The server already
+    // emits provider-grouped rows, but v1/v2 localStorage silently overrode
+    // that DOM order and made same-provider accounts look scattered.
+    if ((parseInt(raw.v, 10) || 0) >= 3 && Array.isArray(raw.order)) {
+      S.order = raw.order.slice();
+      S.orderCustomized = !!raw.orderCustomized;
+    }
     if (Array.isArray(raw.hidden)) S.hidden = raw.hidden.slice();
     if (raw.show) SHOW.forEach(function(p){
       if (raw.show[p[0]] !== undefined) S.show[p[0]] = !!raw.show[p[0]];
@@ -1210,10 +1217,15 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     return m;
   }
 
-  // keep order/hidden in sync with whatever accounts the page actually has:
-  // new ones land at the end and start visible, vanished ones are dropped
+  // Follow the server's provider-grouped DOM order until the visitor makes a
+  // manual move. After that, new accounts land at the end; vanished ones drop.
   function syncOrder(){
     var names = cards().map(acctOf);
+    if (!S.orderCustomized) {
+      S.order = names.slice();
+      S.hidden = S.hidden.filter(function(n){ return names.indexOf(n) >= 0; });
+      return;
+    }
     S.order = S.order.filter(function(n){ return names.indexOf(n) >= 0; });
     names.forEach(function(n){ if (S.order.indexOf(n) < 0) S.order.push(n); });
     S.hidden = S.hidden.filter(function(n){ return names.indexOf(n) >= 0; });
@@ -1305,6 +1317,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         b.onclick = function(){
           var j = i + spec[1];
           var t = S.order[i]; S.order[i] = S.order[j]; S.order[j] = t;
+          S.orderCustomized = true;
           save(); apply(); buildPanel();
         };
         btns.appendChild(b);
@@ -1426,10 +1439,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     if (!card) return;
     e.preventDefault();
     syncOrder(); useCustomSort();
+    S.orderCustomized = true;
     draggingCard = card; dragPointer = e.pointerId;
     card.classList.add('dragging');
-    card.style.pointerEvents = 'none';
-    if (handle.setPointerCapture) handle.setPointerCapture(e.pointerId);
+    document.body.classList.add('is-dragging');
   });
   document.addEventListener('pointermove', function(e){
     if (!draggingCard || e.pointerId !== dragPointer) return;
@@ -1446,13 +1459,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }, {passive: false});
   function finishDrag(e){
     if (!draggingCard || (e && e.pointerId !== dragPointer)) return;
-    draggingCard.style.pointerEvents = '';
     draggingCard.classList.remove('dragging');
+    document.body.classList.remove('is-dragging');
     draggingCard = null; dragPointer = null;
     clearDropMarks(); save(); apply(); buildPanel();
   }
   document.addEventListener('pointerup', finishDrag);
   document.addEventListener('pointercancel', finishDrag);
+  window.addEventListener('blur', function(){ finishDrag(); });
   document.addEventListener('keydown', function(e){
     var handle = e.target.closest && e.target.closest('.drag-handle');
     if (!handle || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
@@ -1461,6 +1475,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var name = acctOf(handle.closest('.card'));
     var i = S.order.indexOf(name), j = i + (e.key === 'ArrowUp' ? -1 : 1);
     if (i < 0 || j < 0 || j >= S.order.length) return;
+    S.orderCustomized = true;
     var target = S.order[j];
     moveAccount(name, target, e.key === 'ArrowDown');
     save(); apply(); buildPanel(); handle.focus();
@@ -1487,7 +1502,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     if (!obj || typeof obj !== 'object') { flash(btn, '格式不对'); return false; }
     try { localStorage.setItem(KEY, JSON.stringify(obj)); }
     catch (e) { flash(btn, '格式不对'); return false; }
-    load(); apply(); buildPanel();
+    load(); apply(); save(); buildPanel();
     flash(btn, '已导入');
     return true;
   }
@@ -1535,6 +1550,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
   load();
   apply();
+  save();
 })();
 </script>
 </body>
