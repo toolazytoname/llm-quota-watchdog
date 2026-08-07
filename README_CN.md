@@ -37,9 +37,8 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 | 能调什么 | 选项 |
 |---|---|
 | 主题 | **跟随系统** / 深色 / 浅色（默认白天浅、晚上深，按你的系统自动切；也可手动锁定） |
-| 密度 | 舒适 / 紧凑 / **极简单行**（每个账号压成一行，几个账号都绝对一屏） |
-| 列数 | 自动 / 1 / 2 / 3 / 4 |
-| 账号 | 逐个显示或隐藏、↑↓ 调整顺序 |
+| 密度 | **横向图表**（默认，满宽使用率条 + 独立容量档位）/ 紧凑图表 / 极简单行 |
+| 账号 | 同供应商默认相邻；可直接拖动账号行，或在设置里用 ↑↓ 调整顺序，并可逐个显示或隐藏 |
 | 排序 | 自定义顺序 / 按用量高低（告急自动置顶） |
 | 显示内容 | 健康徽章、卡片副标题、重置时间、节奏提示、更新时间、套餐到期、顶部摘要，逐项开关 |
 | 自动刷新 | 关闭 / 5 分钟 ~ 3 小时 |
@@ -144,7 +143,7 @@ location /quota/ {
 | `bark_url_file` / `ntfy_url_file` | 同上，但从文件读（key 不落进 config.json），配了文件就以文件为准 |
 | `page_title` | 页面标题，默认「大模型额度监控」 |
 | `cliproxyapi_auth_dir` | CLIProxyAPI 的 OAuth `*.json` 目录，Claude/Codex 自动发现 |
-| `accounts` | 显式账号列表，也决定卡片默认顺序。每项可配 `label`（卡片标题）、`sub`（副标题，如邮箱或套餐档位）、`api_key`/`api_key_file`（Kimi/GLM）或 `auth_file`（Claude/Codex） |
+| `accounts` | 显式账号列表，也决定卡片默认顺序。每项可配 `label`（卡片标题）、`sub`（副标题，如邮箱或套餐档位）、`quota_factor`（同供应商真实倍率）、`capacity_index`（跨平台近似容量指数）、`quota_label`/`quota_labels`（原生额度文案）、`api_key`/`api_key_file`（Kimi/GLM）或 `auth_file`（Claude/Codex） |
 | `relaxed_accounts` | 只保留"快用完"告警的账号标签 |
 | `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → 页面倒计时 + 到期提醒（key 用账号 label） |
 | `monthly_snapshot` | 月度配额快照，显示在页面上（key 用账号 label）；没配 `monthly_web_token_file` 的账号需手动维护，配了的会自动刷新 |
@@ -155,6 +154,8 @@ location /quota/ {
 | `cliproxyapi_management_url` | CLIProxyAPI 管理 API 地址，默认 `http://127.0.0.1:8317/v0/management/auth-files` |
 
 `accounts` 留空也能跑：Claude/Codex 会从 `cliproxyapi_auth_dir` 自动发现，卡片标题就是认证文件名。想要好看的标题和副标题，再显式写进 `accounts` 即可——显式配过的认证文件不会被重复自动发现，所以两个 Codex 账号只写一个也不会漏掉另一个。
+
+所有使用率轨道都保持满宽，只表达 0–100% 的已用比例，因此小套餐不会再被压成难以辨认的短线。`quota_factor` 表示**同一供应商内的真实额度倍率，不是价格倍率**。`capacity_index` 是把不同供应商放在一起的人工近似指数，并不把 Codex messages、GLM credits 和 Kimi units 伪装成同一种 token；未配置原生额度文案时，页面会明确显示“跨平台≈N×”。套餐体量在轨道旁用三级短标识帮助扫视（不高于 1×、不高于 6×、高于 6×），同时保留配置中的准确倍率或原生额度文案。每个账号会把可用的最长周期排在最前面。`quota_label` 用于通用原生额度文案；如果 5 小时与周窗口的绝对数不同，用 `quota_labels: {"5h": "12,000 credits / 5小时", "7d": "60,000 credits / 周"}` 分别显示。
 
 ## 新增 / 换掉一个账号
 

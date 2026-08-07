@@ -37,9 +37,8 @@ Two toolbar buttons:
 | What | Options |
 |---|---|
 | Theme | **follow system** / dark / light (auto day/night by your OS; or pin one) |
-| Density | comfortable / compact / **mini** (one row per account — always one screen, however many you have) |
-| Columns | auto / 1 / 2 / 3 / 4 |
-| Accounts | show or hide each one, reorder with ↑↓ |
+| Density | **horizontal chart** (default; full-width usage tracks with separate capacity tiers) / compact chart / mini |
+| Accounts | same-provider plans stay adjacent by default; drag rows directly or use ↑↓ in settings, and show/hide each one |
 | Sorting | custom order / by usage (most-burnt first) |
 | Details | health badge, card subtitle, reset time, pace hint, fetch time, plan expiry, top summary — each toggleable |
 | Auto refresh | off / 5 min – 3 h |
@@ -153,7 +152,7 @@ See [config.example.json](config.example.json) — every key has a sane default.
 | `bark_url_file` / `ntfy_url_file` | same, but read from a file so the key stays out of config.json; the file wins if both are set |
 | `page_title` | dashboard heading (default: 大模型额度监控) |
 | `cliproxyapi_auth_dir` | directory with CLIProxyAPI OAuth `*.json` files; Claude/Codex auto-discovered |
-| `accounts` | explicit account list; also the default card order. Each entry takes `label` (card title), `sub` (subtitle, e.g. the email or plan tier), `api_key`/`api_key_file` (Kimi/GLM) or `auth_file` (Claude/Codex) |
+| `accounts` | explicit account list; also the default card order. Each entry takes `label` (card title), `sub` (subtitle), `quota_factor` (real within-provider multiplier), `capacity_index` (approximate cross-provider capacity), `quota_label`/`quota_labels` (native allowance text), `api_key`/`api_key_file` (Kimi/GLM), or `auth_file` (Claude/Codex) |
 | `relaxed_accounts` | labels that only get the "nearly used up" alert |
 | `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → countdown on page + expiry alerts (keyed by account label) |
 | `monthly_snapshot` | monthly quota shown on the page (keyed by account label); manually-maintained unless the account has `monthly_web_token_file`, in which case it's auto-refreshed (see [Kimi monthly quota token](#kimi-monthly-quota-token)) |
@@ -164,6 +163,8 @@ See [config.example.json](config.example.json) — every key has a sane default.
 | `cliproxyapi_management_url` | CLIProxyAPI management API URL, default `http://127.0.0.1:8317/v0/management/auth-files` |
 
 Leaving `accounts` empty still works: Claude/Codex are auto-discovered from `cliproxyapi_auth_dir` and each card is titled after its auth filename. Add entries to `accounts` when you want nicer titles and subtitles — an auth file you configured explicitly is not auto-discovered a second time, so listing one of your two Codex accounts by hand won't drop the other.
+
+Every usage track stays full-width and means exactly 0–100% consumed, so a small plan never collapses into an unreadable sliver. `quota_factor` is the real **within-provider allowance multiplier, not a price multiplier**. `capacity_index` is a deliberately approximate cross-provider index rather than a claim that Codex messages, GLM credits, and Kimi units are the same token; when no native allowance label is configured, the page discloses it as `cross-platform ≈Nx`. Plan size appears beside the track as one of three scan-friendly tiers (up to 1x, up to 6x, or above 6x), while the exact configured multiplier or native allowance remains visible as text. Each account renders its longest available quota window first. `quota_label` supplies native allowance text. Use `quota_labels`, for example `{"5h": "12,000 credits / 5h", "7d": "60,000 credits / week"}`, when absolute totals differ by window.
 
 ## Adding or rotating an account
 

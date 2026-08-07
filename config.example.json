@@ -25,6 +25,12 @@
       "type": "glm",
       "label": "GLM Coding",
       "sub": "Pro",
+      "quota_factor": 6,
+      "capacity_index": 6,
+      "quota_labels": {
+        "5h": "12,000 credits / 5小时",
+        "7d": "60,000 credits / 周"
+      },
       "api_key_file": "~/.config/llm-quota-watchdog/glm-key"
     }
   ],

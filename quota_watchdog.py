@@ -28,12 +28,13 @@ import calendar
 import datetime
 import html
 import json
+import math
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.5.0"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
@@ -774,13 +775,59 @@ def fill_class(pct):
     return ""
 
 
-def window_html(cfg, label, pct, reset, note="", elapsed=None):
+def quota_capacity_info(acct, window=None):
+    """Return a three-step capacity tier and its human-readable label.
+
+    ``quota_factor`` records the real within-provider plan multiplier, while
+    ``capacity_index`` is an explicitly approximate cross-provider index.
+    Provider units are not directly comparable (Codex messages, GLM credits,
+    Kimi internal units), so the cross-provider index is allowed to be a rough
+    operator estimate and is labelled as such in the UI. Usage tracks always
+    remain full-width and represent only percentage consumed; plan size is
+    encoded separately as a small / medium / large three-step marker. The
+    configured multiplier remains visible as text, so the marker is a scan aid
+    rather than a claim that unlike provider units are precisely comparable.
+
+    Accounts without a cross-provider index fall back to their provider factor;
+    accounts with neither simply omit the tier marker.
+    """
+    factors = acct.get("quota_factors") or {}
+    indexes = acct.get("capacity_indexes") or {}
+    labels = acct.get("quota_labels") or {}
+    factor_raw = factors.get(window, acct.get("quota_factor"))
+    index_raw = indexes.get(window, acct.get("capacity_index"))
+    label = str(labels.get(window, acct.get("quota_label") or ""))
+
+    def positive_number(raw):
+        if raw in (None, ""):
+            return None
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and number > 0 else None
+
+    index = positive_number(index_raw)
+    factor = positive_number(factor_raw)
+    scale = index if index is not None else factor
+    if scale is None:
+        return 0, label
+    tier = 1 if scale <= 1 else (2 if scale <= 6 else 3)
+    if index is not None and not label:
+        label = "跨平台≈%g×" % index
+    elif not label:
+        label = "%g×" % factor
+    return tier, label
+
+
+def window_html(cfg, label, pct, reset, note="", elapsed=None,
+                capacity_tier=0, quota_label=""):
     """One quota bar. data-pct / data-short / data-reset-short are read by the
     page's summary line, which recomputes "who's most at risk" from whatever
     cards are currently visible. The title attribute keeps the reset time and
     pace reachable in the mini density, which hides both to stay one row tall."""
     pct_txt = "未知" if pct is None else ("%.2f%%" % pct if pct < 10 else "%.1f%%" % pct)
-    width = 0 if pct is None else max(min(pct, 100), 0.5)
+    fill_width = "0" if pct is None or pct <= 0 else "max(3px, %.1f%%)" % min(pct, 100)
     marker_html = ""
     if elapsed is not None:
         marker_html = '<div class="time-marker" style="left:%.1f%%"></div>' % max(min(elapsed, 100), 0)
@@ -799,17 +846,36 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None):
     # the percentage picks up the same state colour as its bar, so a near-ceiling
     # window reads amber at a glance from the number alone
     pct_cls = ("pct " + fc).strip()
+    capacity_html = ""
+    if quota_label:
+        steps_html = ""
+        if capacity_tier:
+            tier_name = {1: "小档", 2: "中档", 3: "大档"}.get(capacity_tier, "容量档位")
+            steps = "".join(
+                '<i class="capacity-step%s"></i>' % (" on" if n <= capacity_tier else "")
+                for n in range(1, 4)
+            )
+            steps_html = ('<span class="capacity-steps" role="img" aria-label="额度规模%s">%s</span>'
+                          % (tier_name, steps))
+        capacity_html = ('<span class="capacity"><span>额度规模</span><strong>%s</strong>%s</span>'
+                         % (html.escape(quota_label), steps_html))
+    title_txt = "%s / %s%s%s" % (
+        label, reset_txt, " / " + note if note else "",
+        " / 总量 " + quota_label if quota_label else "")
     return """
-    <div class="win" data-pct="%s" data-short="%s" data-reset-short="%s" title="%s">
+    <div class="win" data-pct="%s" data-short="%s" data-reset-short="%s" data-capacity="%s" title="%s">
       <div class="win-head"><span>%s</span><span class="%s">%s</span></div>
-      <div class="bar"><div class="%s" style="width:%.1f%%"></div>%s</div>
+      <div class="win-scale">
+        <div class="bar"><div class="%s" style="width:%s"></div>%s</div>
+      </div>
       <div class="meta"><span class="reset">%s</span>%s</div>
+      %s
     </div>""" % ("" if pct is None else "%.1f" % pct, html.escape(label),
                  html.escape(reset_left(reset)),
-                 html.escape("%s / %s%s" % (label, reset_txt, " / " + note if note else "")),
+                 html.escape(quota_label), html.escape(title_txt),
                  html.escape(label), pct_cls, pct_txt,
-                 fill_cls, width, marker_html,
-                 html.escape(reset_txt), note_html)
+                 fill_cls, fill_width, marker_html,
+                 html.escape(reset_txt), note_html, capacity_html)
 
 
 
@@ -845,7 +911,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --card-shadow: inset 0 1px 0 rgba(255,255,255,.03), 0 8px 24px rgba(0,0,0,.35);
     --card-alert-border: #3a2a18; --card-alert-bg: var(--card);
     --ink: #e6e7ea; --ink-2: #9ca3af; --ink-3: #6b7280;
-    --bar-track: #23262c;
+    --bar-track: #303640; --bar-track-border: rgba(255,255,255,.075); --bar-marker: #d7dbe1;
+    --capacity-track: #191c21; --capacity-on: #9ca3af;
     --accent: #3ecf8e; --accent-ink: #04130c;
     --warn: #f5a524; --bad: #f87171; --good: #3ecf8e;
     --summary-bg: #131518; --summary-border: #1e2024;
@@ -860,7 +927,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       --card-shadow: 0 1px 2px rgba(43,42,39,.04);
       --card-alert-border: #e9c9a8; --card-alert-bg: #fdf8f0;
       --ink: #2b2a27; --ink-2: #6b6960; --ink-3: #9b988f;
-      --bar-track: #f0eee8;
+      --bar-track: #ddd9d0; --bar-track-border: rgba(43,42,39,.09); --bar-marker: #5d5b55;
+      --capacity-track: #f4f2ed; --capacity-on: #8d8a82;
       --accent: #4f9d7a; --accent-ink: #ffffff;
       --warn: #d18a3e; --bad: #c0492f; --good: #4f9d7a;
       --summary-bg: #ffffff; --summary-border: #eceae4;
@@ -871,7 +939,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --bg: #0a0b0d; --bg-2: #131518; --card: #131518; --card-border: #1e2024;
     --card-shadow: inset 0 1px 0 rgba(255,255,255,.03), 0 8px 24px rgba(0,0,0,.35);
     --card-alert-border: #3a2a18; --card-alert-bg: var(--card);
-    --ink: #e6e7ea; --ink-2: #9ca3af; --ink-3: #6b7280; --bar-track: #23262c;
+    --ink: #e6e7ea; --ink-2: #9ca3af; --ink-3: #6b7280;
+    --bar-track: #303640; --bar-track-border: rgba(255,255,255,.075); --bar-marker: #d7dbe1;
+    --capacity-track: #191c21; --capacity-on: #9ca3af;
     --accent: #3ecf8e; --accent-ink: #04130c; --warn: #f5a524; --bad: #f87171; --good: #3ecf8e;
     --summary-bg: #131518; --summary-border: #1e2024; --ui-font: "Space Grotesk"; --num-weight: 300;
   }
@@ -879,7 +949,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --bg: #f7f6f3; --bg-2: #ffffff; --card: #ffffff; --card-border: #eceae4;
     --card-shadow: 0 1px 2px rgba(43,42,39,.04);
     --card-alert-border: #e9c9a8; --card-alert-bg: #fdf8f0;
-    --ink: #2b2a27; --ink-2: #6b6960; --ink-3: #9b988f; --bar-track: #f0eee8;
+    --ink: #2b2a27; --ink-2: #6b6960; --ink-3: #9b988f;
+    --bar-track: #ddd9d0; --bar-track-border: rgba(43,42,39,.09); --bar-marker: #5d5b55;
+    --capacity-track: #f4f2ed; --capacity-on: #8d8a82;
     --accent: #4f9d7a; --accent-ink: #ffffff; --warn: #d18a3e; --bad: #c0492f; --good: #4f9d7a;
     --summary-bg: #ffffff; --summary-border: #eceae4; --ui-font: "Manrope"; --num-weight: 600;
   }
@@ -903,72 +975,108 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   select, textarea { background: var(--bg); color: var(--ink); border: 1px solid var(--card-border); border-radius: 8px; padding: 5px 9px; font-size: 12px; font-family: inherit; }
   .gear { width: 13px; height: 13px; opacity: .85; }
 
-  #cards { display: grid; grid-template-columns: repeat(var(--cols, auto-fill), minmax(300px, 1fr)); gap: 16px; align-items: start; }
-  .card { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 20px; box-shadow: var(--card-shadow); position: relative; }
-  .card.alert { border-color: var(--card-alert-border); background: var(--card-alert-bg); }
+  /* Default view: a horizontal usage chart. Account labels occupy one fixed
+     column and every quota lane starts at the same x coordinate. Track length
+     always means 0–100% usage; plan capacity has a separate tier marker. */
+  #chart-guide { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; align-items: end; padding: 0 20px 8px; }
+  .guide-title { color: var(--ink-3); font-size: 10px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; }
+  .axis-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
+  .usage-axis { height: 28px; border-bottom: 1px solid var(--card-border); display: flex; align-items: flex-end; justify-content: space-between; padding-bottom: 7px; color: var(--ink-3); font-family: var(--mono); font-size: 9.5px; }
+
+  #cards { display: flex; flex-direction: column; gap: 0; align-items: stretch; }
+  .card { display: grid; grid-template-columns: 220px minmax(0, 1fr); column-gap: 24px; row-gap: 6px; padding: 18px 20px; border: 0; border-bottom: 1px solid var(--card-border); border-radius: 0; background: transparent; box-shadow: none; position: relative; }
+  .card.alert { border-color: var(--card-alert-border); background: transparent; }
   .card.hidden { display: none; }
-  .card h2 { font-size: 14.5px; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; font-weight: 600; letter-spacing: -.01em; }
+  .card h2 { grid-column: 1; grid-row: 1; font-size: 14.5px; margin: 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; font-weight: 600; letter-spacing: -.01em; }
   .title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .plan { color: var(--ink-3); font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
   .card-actions { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 400; white-space: nowrap; flex-shrink: 0; }
+  .drag-handle { color: var(--ink-3); cursor: grab; font-size: 10px; font-weight: 500; padding: 7px 3px; touch-action: none; user-select: none; }
+  .drag-handle:active { cursor: grabbing; }
+  .drag-handle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  .card.dragging { opacity: .45; }
+  .card.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+  .card.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
   .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--ink-2); font-weight: 500; }
   .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); }
   .badge.b-warn { color: var(--warn); } .badge.b-warn .dot { background: var(--warn); }
   .badge.b-bad { color: var(--bad); } .badge.b-bad .dot { background: var(--bad); }
   .badge.b-idle { color: var(--ink-3); } .badge.b-idle .dot { background: var(--ink-3); }
-  .wins { margin-top: 16px; }
-  .win { margin-bottom: 16px; }
-  .win:last-child { margin-bottom: 0; }
+  .wins { grid-column: 2; grid-row: 1 / span 4; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; min-width: 0; margin-top: 0; }
+  .win { min-width: 0; }
+  .win-scale { max-width: 100%; }
   .win-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
   .win-head > span:first-child { font-size: 11px; color: var(--ink-3); letter-spacing: .04em; text-transform: uppercase; font-weight: 500; }
   .pct { font-family: var(--ui-font); font-weight: var(--num-weight); color: var(--ink); font-size: 30px; letter-spacing: -.03em; line-height: 1; font-variant-numeric: tabular-nums; }
   .pct.warn { color: var(--warn); }
   .pct.crit { color: var(--bad); }
-  .bar { position: relative; background: var(--bar-track); height: 6px; border-radius: 99px; overflow: visible; }
-  .fill { height: 100%; background: var(--accent); border-radius: 99px; transition: width .3s; }
+  .bar { position: relative; width: 100%; height: 8px; border: 1px solid var(--bar-track-border); border-radius: 99px; background: var(--bar-track); box-shadow: inset 0 1px 2px rgba(0,0,0,.16); overflow: visible; }
+  .fill { position: absolute; top: -1px; bottom: -1px; left: -1px; height: auto; background: var(--accent); border-radius: 99px; }
   .fill.high { background: var(--warn); }
   .fill.crit { background: var(--bad); }
-  .time-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink-3); opacity: .55; border-radius: 1px; }
+  .time-marker { position: absolute; z-index: 2; top: -4px; bottom: -4px; width: 2px; background: var(--bar-marker); box-shadow: 0 0 0 1px var(--bg); opacity: .8; border-radius: 2px; }
   .meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
   .reset { color: var(--ink-3); font-size: 10.5px; font-family: var(--mono); }
   .note { color: var(--ink-3); font-size: 10.5px; }
   .note.pace-fast { color: var(--warn); }
   .note.pace-slow { color: #6a8caf; }
+  .capacity { display: flex; align-items: center; gap: 7px; color: var(--ink-3); font-size: 9.5px; font-family: var(--mono); margin-top: 7px; letter-spacing: .01em; white-space: nowrap; }
+  .capacity strong { min-width: 0; color: var(--ink-2); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+  .capacity-steps { display: grid; grid-template-columns: repeat(3, 13px); gap: 3px; flex: 0 0 auto; }
+  .capacity-step { display: block; height: 5px; border: 1px solid var(--card-border); border-radius: 2px; background: var(--capacity-track); }
+  .capacity-step.on { border-color: var(--capacity-on); background: var(--capacity-on); }
   .err { color: var(--bad); font-size: 12.5px; }
-  .expiry { color: var(--ink-2); font-size: 10.5px; margin-top: 12px; font-family: var(--mono); }
-  .fetched { color: var(--ink-3); font-size: 10px; margin-top: 12px; font-family: var(--mono); }
+  .expiry { grid-column: 1; grid-row: 2; color: var(--ink-2); font-size: 10.5px; margin-top: 6px; font-family: var(--mono); }
+  .fetched { grid-column: 1; grid-row: 3; color: var(--ink-3); font-size: 10px; margin-top: 2px; font-family: var(--mono); }
 
-  /* density: compact — smaller hero number, tighter cards, more per screen */
-  body.d-compact .card { padding: 15px; }
-  body.d-compact .wins { margin-top: 12px; }
-  body.d-compact .win { margin-bottom: 11px; }
+  /* density: compact chart — same usage axis, tighter account rows */
+  body.d-compact #chart-guide { grid-template-columns: 190px minmax(0, 1fr); gap: 18px; padding-left: 16px; padding-right: 16px; }
+  body.d-compact .card { grid-template-columns: 190px minmax(0, 1fr); column-gap: 18px; padding: 13px 16px; }
+  body.d-compact .axis-grid, body.d-compact .wins { gap: 18px; }
+  body.d-compact .wins { margin-top: 0; }
   body.d-compact .pct { font-size: 21px; }
   body.d-compact .win-head { margin-bottom: 5px; }
   body.d-compact .meta { margin-top: 6px; }
 
   /* density: mini — one row per account, bars only */
-  body.d-mini #cards { grid-template-columns: 1fr; gap: 8px; }
-  body.d-mini .card { display: flex; align-items: center; gap: 14px; padding: 11px 16px; }
+  body.d-mini #chart-guide { display: none; }
+  body.d-mini #cards { display: grid; grid-template-columns: 1fr; gap: 8px; }
+  body.d-mini .card { display: flex; align-items: center; gap: 14px; padding: 11px 16px; background: var(--card); border: 1px solid var(--card-border); border-radius: var(--radius); box-shadow: var(--card-shadow); }
+  body.d-mini .card.alert { border-color: var(--card-alert-border); background: var(--card-alert-bg); }
   body.d-mini .card h2 { display: contents; }
   body.d-mini .title { flex: 0 0 clamp(108px, 17vw, 190px); font-size: 13.5px; }
   body.d-mini .card-actions { order: 9; }
-  body.d-mini .wins { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; min-width: 0; margin-top: 0; }
-  body.d-mini .win { margin-bottom: 0; }
-  body.d-mini .win[data-short="5小时"] { grid-column: 1; }
-  body.d-mini .win[data-short="7天"] { grid-column: 2; }
-  body.d-mini .win[data-short="月度"] { grid-column: 1; }
+  body.d-mini .wins { flex: 1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px 18px; min-width: 0; margin-top: 0; }
   body.d-mini .win-head { margin-bottom: 3px; }
   body.d-mini .win-head > span:first-child { font-size: 10px; }
   body.d-mini .pct { font-size: 14px; font-weight: 600; }
-  body.d-mini .bar { height: 5px; }
-  body.d-mini .meta, body.d-mini .expiry, body.d-mini .fetched, body.d-mini .plan { display: none; }
+  body.d-mini .bar { height: 6px; }
+  body.d-mini .meta, body.d-mini .expiry, body.d-mini .fetched, body.d-mini .plan, body.d-mini .capacity { display: none; }
+
+  @media (max-width: 700px) {
+    body { padding: 20px 16px; }
+    .btn, .mini-btn { min-height: 44px; }
+    .drag-handle { min-width: 44px; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; }
+    header.top { align-items: flex-start; }
+    .updated { max-width: 52%; text-align: right; }
+    #chart-guide { grid-template-columns: 1fr; padding: 0 14px 8px; }
+    .guide-title { display: none; }
+    .axis-grid { grid-template-columns: 1fr; }
+    .axis-grid .usage-axis:nth-child(n+2) { display: none; }
+    .card { grid-template-columns: 1fr; column-gap: 0; padding: 16px 14px; }
+    .card h2, .card .wins, .card > .expiry, .card > .fetched { grid-column: 1; grid-row: auto; }
+    .card .wins { grid-template-columns: 1fr; gap: 20px; margin-top: 18px; }
+    body.d-compact #chart-guide { grid-template-columns: 1fr; padding-left: 12px; padding-right: 12px; }
+    body.d-compact .card { grid-template-columns: 1fr; column-gap: 0; padding: 13px 12px; }
+  }
 
   /* per-item visibility toggles from the settings panel */
   body.hide-badge .badge { display: none; }
   body.hide-sub .plan { display: none; }
   body.hide-reset .reset { display: none; }
   body.hide-pace .note, body.hide-pace .time-marker { display: none; }
+  body.hide-capacity .capacity { display: none; }
   body.hide-fetched .fetched { display: none; }
   body.hide-expiry .expiry { display: none; }
   body.hide-summary #summary { display: none; }
@@ -1014,6 +1122,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <button class="btn" id="share-toggle" title="隐藏邮箱、时间戳等可识别信息，方便截图分享">隐私模式</button>
   <button class="btn" id="open-settings"><svg class="gear" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.3 3.3l1.4 1.4M11.3 11.3l1.4 1.4M3.3 12.7l1.4-1.4M11.3 4.7l1.4-1.4"/></svg>显示设置</button>
 </div>
+<div id="chart-guide">
+  <span class="guide-title">套餐 / 周期从长到短</span>
+  <div class="axis-grid" aria-label="每条轨道均表示从零到百分之百的使用比例">
+    <div class="usage-axis"><span>使用比例</span><span>100%</span></div>
+    <div class="usage-axis" aria-hidden="true"><span>使用比例</span><span>100%</span></div>
+    <div class="usage-axis" aria-hidden="true"><span>使用比例</span><span>100%</span></div>
+  </div>
+</div>
 <div id="cards">@CARDS@</div>
 
 <div class="modal" id="settings" hidden>
@@ -1023,11 +1139,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <option value="auto">跟随系统</option><option value="dark">深色</option><option value="light">浅色</option>
     </select></div>
     <div class="set-row"><span>密度</span><select id="set-density">
-      <option value="comfy">舒适</option><option value="compact">紧凑</option><option value="mini">极简单行</option>
-    </select></div>
-    <div class="set-row"><span>列数</span><select id="set-cols">
-      <option value="0">自动</option><option value="1">1 列</option><option value="2">2 列</option>
-      <option value="3">3 列</option><option value="4">4 列</option>
+      <option value="comfy">横向图表</option><option value="compact">紧凑图表</option><option value="mini">极简单行</option>
     </select></div>
     <div class="set-row"><span>排序</span><select id="set-sort">
       <option value="custom">自定义顺序</option><option value="usage">按用量高低（告急置顶）</option>
@@ -1059,11 +1171,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 (function(){
   var KEY = 'quotaSettings';
   var SHOW = [['badge','健康徽章'], ['sub','卡片副标题'], ['reset','重置时间'],
+              ['capacity','套餐总量'],
               ['pace','节奏提示与时间刻度'], ['fetched','更新时间'], ['expiry','套餐到期'],
               ['summary','顶部摘要']];
   function defaults(){
-    return {v: 1, theme: 'auto', density: 'comfy', cols: 0, sort: 'custom', order: [], hidden: [],
-            show: {badge: true, sub: true, reset: true, pace: true, fetched: true, expiry: true, summary: true},
+    return {v: 2, theme: 'auto', density: 'comfy', sort: 'custom', order: [], hidden: [],
+            show: {badge: true, sub: true, reset: true, capacity: true, pace: true, fetched: true, expiry: true, summary: true},
             autoRefresh: 0};
   }
   var S = defaults(), timer = null;
@@ -1072,7 +1185,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var raw = {};
     try { raw = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
     S = defaults();
-    ['theme', 'density', 'cols', 'sort', 'autoRefresh'].forEach(function(k){
+    ['theme', 'density', 'sort', 'autoRefresh'].forEach(function(k){
       if (raw[k] !== undefined) S[k] = raw[k];
     });
     if (Array.isArray(raw.order)) S.order = raw.order.slice();
@@ -1117,11 +1230,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     if (S.theme === 'dark') b.classList.add('theme-dark');
     else if (S.theme === 'light') b.classList.add('theme-light');
     SHOW.forEach(function(p){ b.classList.toggle('hide-' + p[0], !S.show[p[0]]); });
-    document.getElementById('cards').style.setProperty('--cols', S.cols ? String(S.cols) : 'auto-fill');
     cards().forEach(function(c){
       var n = acctOf(c);
       c.classList.toggle('hidden', S.hidden.indexOf(n) >= 0);
-      // grid order, so reordering never touches the DOM the refresh patches
+      // visual order, so reordering never touches the DOM the refresh patches
       c.style.order = (S.sort === 'usage') ? Math.round(1000 - maxPct(c)) : S.order.indexOf(n);
     });
     renderSummary();
@@ -1162,7 +1274,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   function buildPanel(){
     document.getElementById('set-theme').value = S.theme;
     document.getElementById('set-density').value = S.density;
-    document.getElementById('set-cols').value = String(S.cols);
     document.getElementById('set-sort').value = S.sort;
     document.getElementById('set-refresh').value = String(S.autoRefresh);
 
@@ -1280,9 +1391,80 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
   bindSelect('set-theme', 'theme', false);
   bindSelect('set-density', 'density', false);
-  bindSelect('set-cols', 'cols', true);
   bindSelect('set-sort', 'sort', false);
   bindSelect('set-refresh', 'autoRefresh', true);
+
+  // ---- direct account reordering: pointer drag works with mouse and touch;
+  // the focused handle also supports ArrowUp / ArrowDown for keyboard users ----
+  var draggingCard = null, dragPointer = null;
+  function clearDropMarks(){
+    cards().forEach(function(c){ c.classList.remove('drop-before', 'drop-after'); });
+  }
+  function paintCustomOrder(){
+    cards().forEach(function(c){ c.style.order = S.order.indexOf(acctOf(c)); });
+  }
+  function useCustomSort(){
+    if (S.sort !== 'custom') {
+      S.sort = 'custom';
+      var sel = document.getElementById('set-sort');
+      if (sel) sel.value = 'custom';
+    }
+  }
+  function moveAccount(name, targetName, after){
+    var from = S.order.indexOf(name);
+    if (from < 0 || name === targetName) return;
+    S.order.splice(from, 1);
+    var at = S.order.indexOf(targetName);
+    if (at < 0) { S.order.push(name); return; }
+    S.order.splice(at + (after ? 1 : 0), 0, name);
+    paintCustomOrder();
+  }
+  document.addEventListener('pointerdown', function(e){
+    var handle = e.target.closest && e.target.closest('.drag-handle');
+    if (!handle) return;
+    var card = handle.closest('.card');
+    if (!card) return;
+    e.preventDefault();
+    syncOrder(); useCustomSort();
+    draggingCard = card; dragPointer = e.pointerId;
+    card.classList.add('dragging');
+    card.style.pointerEvents = 'none';
+    if (handle.setPointerCapture) handle.setPointerCapture(e.pointerId);
+  });
+  document.addEventListener('pointermove', function(e){
+    if (!draggingCard || e.pointerId !== dragPointer) return;
+    e.preventDefault();
+    if (e.clientY < 72) window.scrollBy(0, -12);
+    else if (e.clientY > window.innerHeight - 72) window.scrollBy(0, 12);
+    var hit = document.elementFromPoint(e.clientX, e.clientY);
+    var target = hit && hit.closest && hit.closest('#cards .card:not(.hidden)');
+    clearDropMarks();
+    if (!target || target === draggingCard) return;
+    var after = e.clientY >= target.getBoundingClientRect().top + target.getBoundingClientRect().height / 2;
+    target.classList.add(after ? 'drop-after' : 'drop-before');
+    moveAccount(acctOf(draggingCard), acctOf(target), after);
+  }, {passive: false});
+  function finishDrag(e){
+    if (!draggingCard || (e && e.pointerId !== dragPointer)) return;
+    draggingCard.style.pointerEvents = '';
+    draggingCard.classList.remove('dragging');
+    draggingCard = null; dragPointer = null;
+    clearDropMarks(); save(); apply(); buildPanel();
+  }
+  document.addEventListener('pointerup', finishDrag);
+  document.addEventListener('pointercancel', finishDrag);
+  document.addEventListener('keydown', function(e){
+    var handle = e.target.closest && e.target.closest('.drag-handle');
+    if (!handle || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+    e.preventDefault();
+    syncOrder(); useCustomSort();
+    var name = acctOf(handle.closest('.card'));
+    var i = S.order.indexOf(name), j = i + (e.key === 'ArrowUp' ? -1 : 1);
+    if (i < 0 || j < 0 || j >= S.order.length) return;
+    var target = S.order[j];
+    moveAccount(name, target, e.key === 'ArrowDown');
+    save(); apply(); buildPanel(); handle.focus();
+  });
 
   // ---- privacy / share mode: session-only, not persisted ----
   var shareBtn = document.getElementById('share-toggle');
@@ -1418,17 +1600,9 @@ def card_html(cfg, acct, entry, health):
     label = acct["label"]
     rows = []
     windows = entry.get("windows") or {}
-    for win in ("5h", "7d"):
-        w = windows.get(win)
-        if not w:
-            continue
-        pct, reset = w.get("pct"), parse_ts(w.get("reset"))
-        pi = pace_info(pct, reset, win)
-        note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
-        rows.append(window_html(cfg, "5小时" if win == "5h" else "7天", pct, reset, note,
-                                elapsed=(pi[0] if pi else None)))
-    # optional monthly snapshot (manual entry, or auto-refreshed via
-    # refresh_monthly_from_web), shown last (widest time span)
+    # Render the longest available quota window first. On desktop these become
+    # left-to-right columns; on mobile they remain top-to-bottom in the same
+    # order, so the most representative usage horizon always leads.
     snap = (cfg.get("monthly_snapshot") or {}).get(label)
     if snap:
         reset_ts = parse_ts(str(snap.get("reset")) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
@@ -1436,8 +1610,21 @@ def card_html(cfg, acct, entry, health):
         note = ("自动更新于 %s" if snap.get("source") == "auto" else "手动更新于 %s") % snap.get("updated", "?")
         if pi:
             note += " · 时间进度 %.0f%% · 节奏%s" % pi
+        capacity_tier, quota_label = quota_capacity_info(acct, "monthly")
         rows.append(window_html(cfg, "月度", snap.get("pct"), reset_ts, note,
-                                elapsed=(pi[0] if pi else None)))
+                                elapsed=(pi[0] if pi else None), capacity_tier=capacity_tier,
+                                quota_label=quota_label))
+    for win in ("7d", "5h"):
+        w = windows.get(win)
+        if not w:
+            continue
+        pct, reset = w.get("pct"), parse_ts(w.get("reset"))
+        pi = pace_info(pct, reset, win)
+        note = "" if pi is None else "时间进度 %.0f%% · 节奏%s" % pi
+        capacity_tier, quota_label = quota_capacity_info(acct, win)
+        rows.append(window_html(cfg, "7天" if win == "7d" else "5小时", pct, reset, note,
+                                elapsed=(pi[0] if pi else None), capacity_tier=capacity_tier,
+                                quota_label=quota_label))
     if entry.get("fetch_error"):
         # shown alongside stale bars when we have them, alone when we don't
         rows.append('<div class="err">查询失败: %s</div>'
@@ -1471,13 +1658,27 @@ def card_html(cfg, acct, entry, health):
     fetched = parse_ts(entry.get("fetched_at"))
     fetched_txt = ("更新于 " + fetched.astimezone(cfg["_tz"]).strftime("%H:%M")) if fetched else "尚未拉取"
     label_esc = html.escape(label)
-    return ('<div class="card%s" data-account="%s" data-health="%s">'
+    provider_esc = html.escape(str(acct.get("type") or "other"))
+    return ('<div class="card%s" data-account="%s" data-provider="%s" data-health="%s">'
             '<h2><span class="title"><span>%s</span>%s</span>'
-            '<span class="card-actions">%s<a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a>'
+            '<span class="card-actions">%s<span class="drag-handle" role="button" tabindex="0" title="拖动账号调整顺序" aria-label="拖动账号调整顺序">拖动</span><a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a>'
             '</span></h2><div class="wins">%s</div>%s<div class="fetched">%s</div></div>'
-            % (" alert" if alert else "", label_esc, html.escape(health or ""), label_esc, sub_html,
+            % (" alert" if alert else "", label_esc, provider_esc, html.escape(health or ""), label_esc, sub_html,
                badge_html, "/refresh?account=" + urllib.parse.quote(label), label_esc,
                "".join(rows), expiry_html, html.escape(fetched_txt)))
+
+
+def group_accounts_by_provider(accounts):
+    """Keep accounts from the same provider adjacent without changing the
+    provider group's first-seen position or the order inside each group."""
+    provider_order, grouped = [], {}
+    for acct in accounts:
+        provider = acct.get("type") or "other"
+        if provider not in grouped:
+            provider_order.append(provider)
+            grouped[provider] = []
+        grouped[provider].append(acct)
+    return [acct for provider in provider_order for acct in grouped[provider]]
 
 
 def render_page(cfg, page_state, accounts):
@@ -1485,6 +1686,7 @@ def render_page(cfg, page_state, accounts):
     management-API health check."""
     bad_set = auth_health_map(cfg)
     cards, unhealthy, healthy = [], [], 0
+    accounts = group_accounts_by_provider(accounts)
     for acct in accounts:
         entry = page_state["accounts"].get(acct["label"]) or {}
         health = resolve_health(cfg, acct, entry, bad_set)
