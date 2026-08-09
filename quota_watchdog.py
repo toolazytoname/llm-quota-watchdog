@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
@@ -1236,23 +1236,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
 
   function expiryRank(card){
-    var best = null, hasPct = false, hasUnused = false;
-    [].forEach.call(card.querySelectorAll('.win'), function(w){
-      var pct = parseFloat(w.getAttribute('data-pct'));
-      if (isNaN(pct)) return;
-      hasPct = true;
-      var remaining = Math.max(0, 100 - pct);
-      if (remaining <= 0.001) return;
-      hasUnused = true;
-      var resetAt = Date.parse(w.getAttribute('data-reset-at') || '');
-      if (isNaN(resetAt)) return;
-      var candidate = {tier: 0, resetAt: resetAt, remaining: remaining};
-      if (!best || compareExpiryRank(candidate, best) < 0) best = candidate;
-    });
-    if (best) return best;
-    if (hasUnused) return {tier: 1, resetAt: Infinity, remaining: 0};
-    if (hasPct) return {tier: 2, resetAt: Infinity, remaining: 0};
-    return {tier: 3, resetAt: Infinity, remaining: 0};
+    // Cards render quota windows longest-first. Sort by that primary window;
+    // a frequently-resetting 5h allowance must not outrank a monthly/weekly one.
+    var w = card.querySelector('.win');
+    if (!w) return {tier: 3, resetAt: Infinity, remaining: 0};
+    var pct = parseFloat(w.getAttribute('data-pct'));
+    if (isNaN(pct)) return {tier: 3, resetAt: Infinity, remaining: 0};
+    var remaining = Math.max(0, 100 - pct);
+    if (remaining <= 0.001) return {tier: 2, resetAt: Infinity, remaining: 0};
+    var resetAt = Date.parse(w.getAttribute('data-reset-at') || '');
+    if (isNaN(resetAt)) return {tier: 1, resetAt: Infinity, remaining: remaining};
+    return {tier: 0, resetAt: resetAt, remaining: remaining};
   }
 
   function compareExpiryRank(a, b){
