@@ -128,20 +128,24 @@ class QuotaScaleTests(unittest.TestCase):
         self.assertIn('aria-label="拖动账号调整顺序"', rendered)
 
     def test_saved_order_migrates_to_provider_grouping_once(self):
-        self.assertIn("return {v: 4", q.PAGE_TEMPLATE)
+        self.assertIn("return {v: 5", q.PAGE_TEMPLATE)
         self.assertIn("orderCustomized: false", q.PAGE_TEMPLATE)
         self.assertIn("if (!S.orderCustomized)", q.PAGE_TEMPLATE)
         self.assertIn("S.order = names.slice()", q.PAGE_TEMPLATE)
         self.assertIn("S.orderCustomized = true", q.PAGE_TEMPLATE)
 
-    def test_expiry_waste_risk_is_the_default_sort(self):
-        self.assertIn("sort: 'waste'", q.PAGE_TEMPLATE)
-        self.assertIn('<option value="waste">按到期浪费风险（默认）</option>', q.PAGE_TEMPLATE)
+    def test_expiry_first_is_the_default_sort(self):
+        self.assertIn("sort: 'expiry'", q.PAGE_TEMPLATE)
+        self.assertIn('<option value="expiry">快到期且未用完（默认）</option>', q.PAGE_TEMPLATE)
+        self.assertIn('<option value="waste">按浪费速度</option>', q.PAGE_TEMPLATE)
+        self.assertIn("function expiryRank(card)", q.PAGE_TEMPLATE)
+        self.assertIn("function compareExpiryRank(a, b)", q.PAGE_TEMPLATE)
+        self.assertIn("if (hasPct) return {tier: 2", q.PAGE_TEMPLATE)
+        self.assertIn("S.sort === 'expiry'", q.PAGE_TEMPLATE)
         self.assertIn("function wasteScore(card)", q.PAGE_TEMPLATE)
-        self.assertIn("function autoOrder(score)", q.PAGE_TEMPLATE)
-        self.assertIn("if (ap === bp) return score(b) - score(a)", q.PAGE_TEMPLATE)
+        self.assertIn("function groupedOrder(compare)", q.PAGE_TEMPLATE)
+        self.assertIn("if (ap === bp) return compare(a, b)", q.PAGE_TEMPLATE)
         self.assertIn("remaining / hoursLeft", q.PAGE_TEMPLATE)
-        self.assertIn("S.sort === 'waste'", q.PAGE_TEMPLATE)
         self.assertIn("b.disabled = spec[2] || S.sort !== 'custom'", q.PAGE_TEMPLATE)
 
     def test_pointer_drag_does_not_capture_a_disabled_target(self):

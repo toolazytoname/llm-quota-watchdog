@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
@@ -1143,7 +1143,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <option value="comfy">横向图表</option><option value="compact">紧凑图表</option><option value="mini">极简单行</option>
     </select></div>
     <div class="set-row"><span>排序</span><select id="set-sort">
-      <option value="waste">按到期浪费风险（默认）</option><option value="usage">按用量高低（告急置顶）</option>
+      <option value="expiry">快到期且未用完（默认）</option><option value="waste">按浪费速度</option>
+      <option value="usage">按用量高低（告急置顶）</option>
       <option value="custom">自定义顺序</option>
     </select></div>
     <div class="set-row"><span>自动刷新</span><select id="set-refresh">
@@ -1177,7 +1178,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
               ['pace','节奏提示与时间刻度'], ['fetched','更新时间'], ['expiry','套餐到期'],
               ['summary','顶部摘要']];
   function defaults(){
-    return {v: 4, theme: 'auto', density: 'comfy', sort: 'waste', order: [], orderCustomized: false, hidden: [],
+    return {v: 5, theme: 'auto', density: 'comfy', sort: 'expiry', order: [], orderCustomized: false, hidden: [],
             show: {badge: true, sub: true, reset: true, capacity: true, pace: true, fetched: true, expiry: true, summary: true},
             autoRefresh: 0};
   }
@@ -1190,9 +1191,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     ['theme', 'density', 'autoRefresh'].forEach(function(k){
       if (raw[k] !== undefined) S[k] = raw[k];
     });
-    // v4 introduces a new default sort. Existing browsers adopt it once;
+    // v5 introduces a clearer expiry-first default. Existing browsers adopt it once;
     // after the migration, the visitor's explicit choice is preserved.
-    if ((parseInt(raw.v, 10) || 0) >= 4 && raw.sort !== undefined) S.sort = raw.sort;
+    if ((parseInt(raw.v, 10) || 0) >= 5 && raw.sort !== undefined) S.sort = raw.sort;
     // v3 intentionally resets the old saved order once. The server already
     // emits provider-grouped rows, but v1/v2 localStorage silently overrode
     // that DOM order and made same-provider accounts look scattered.
@@ -1234,18 +1235,46 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     return best;
   }
 
-  function autoOrder(score){
-    var ordered = cards().slice(), providerBest = {};
+  function expiryRank(card){
+    var best = null, hasPct = false, hasUnused = false;
+    [].forEach.call(card.querySelectorAll('.win'), function(w){
+      var pct = parseFloat(w.getAttribute('data-pct'));
+      if (isNaN(pct)) return;
+      hasPct = true;
+      var remaining = Math.max(0, 100 - pct);
+      if (remaining <= 0.001) return;
+      hasUnused = true;
+      var resetAt = Date.parse(w.getAttribute('data-reset-at') || '');
+      if (isNaN(resetAt)) return;
+      var candidate = {tier: 0, resetAt: resetAt, remaining: remaining};
+      if (!best || compareExpiryRank(candidate, best) < 0) best = candidate;
+    });
+    if (best) return best;
+    if (hasUnused) return {tier: 1, resetAt: Infinity, remaining: 0};
+    if (hasPct) return {tier: 2, resetAt: Infinity, remaining: 0};
+    return {tier: 3, resetAt: Infinity, remaining: 0};
+  }
+
+  function compareExpiryRank(a, b){
+    return (a.tier - b.tier) || (a.resetAt - b.resetAt) || (b.remaining - a.remaining);
+  }
+
+  function compareExpiry(a, b){ return compareExpiryRank(expiryRank(a), expiryRank(b)); }
+
+  function groupedOrder(compare){
+    var ordered = cards().slice(), providerBest = Object.create(null);
     ordered.forEach(function(c){
       var provider = c.getAttribute('data-provider') || '';
-      providerBest[provider] = Math.max(providerBest[provider] === undefined ? -1 : providerBest[provider], score(c));
+      if (!providerBest[provider] || compare(c, providerBest[provider]) < 0) providerBest[provider] = c;
     });
     return ordered.sort(function(a, b){
       var ap = a.getAttribute('data-provider') || '', bp = b.getAttribute('data-provider') || '';
-      if (ap === bp) return score(b) - score(a);
-      return providerBest[bp] - providerBest[ap];
+      if (ap === bp) return compare(a, b);
+      return compare(providerBest[ap], providerBest[bp]);
     });
   }
+
+  function autoOrder(score){ return groupedOrder(function(a, b){ return score(b) - score(a); }); }
 
   // Follow the server's provider-grouped DOM order until the visitor makes a
   // manual move. After that, new accounts land at the end; vanished ones drop.
@@ -1273,7 +1302,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     else if (S.theme === 'light') b.classList.add('theme-light');
     SHOW.forEach(function(p){ b.classList.toggle('hide-' + p[0], !S.show[p[0]]); });
     var ordered = cards().slice();
-    if (S.sort === 'waste') ordered = autoOrder(wasteScore);
+    if (S.sort === 'expiry') ordered = groupedOrder(compareExpiry);
+    else if (S.sort === 'waste') ordered = autoOrder(wasteScore);
     else if (S.sort === 'usage') ordered = autoOrder(maxPct);
     else ordered.sort(function(a, b){ return S.order.indexOf(acctOf(a)) - S.order.indexOf(acctOf(b)); });
     ordered.forEach(function(c, i){
