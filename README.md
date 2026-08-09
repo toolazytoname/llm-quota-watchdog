@@ -39,7 +39,7 @@ Two toolbar buttons:
 | Theme | **follow system** / dark / light (auto day/night by your OS; or pin one) |
 | Density | **horizontal chart** (default; full-width usage tracks with separate capacity tiers) / compact chart / mini |
 | Accounts | same-provider plans stay adjacent by default; drag rows directly or use ↑↓ in settings, and show/hide each one |
-| Sorting | custom order / by usage (most-burnt first) |
+| Sorting | **expiry-waste risk** (default: most unused quota per remaining hour first) / by usage / custom order; automatic sorts keep each provider together |
 | Details | health badge, card subtitle, reset time, pace hint, fetch time, plan expiry, top summary — each toggleable |
 | Auto refresh | off / 5 min – 3 h |
 | Backup | copy config / download file / paste-import / upload file, reset to defaults |

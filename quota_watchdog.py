@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
@@ -822,10 +822,9 @@ def quota_capacity_info(acct, window=None):
 
 def window_html(cfg, label, pct, reset, note="", elapsed=None,
                 capacity_tier=0, quota_label=""):
-    """One quota bar. data-pct / data-short / data-reset-short are read by the
-    page's summary line, which recomputes "who's most at risk" from whatever
-    cards are currently visible. The title attribute keeps the reset time and
-    pace reachable in the mini density, which hides both to stay one row tall."""
+    """One quota bar. Its data attributes drive summary and client-side sorts.
+    The title keeps reset time and pace reachable in the mini density, which
+    hides both to stay one row tall."""
     pct_txt = "未知" if pct is None else ("%.2f%%" % pct if pct < 10 else "%.1f%%" % pct)
     fill_width = "0" if pct is None or pct <= 0 else "max(3px, %.1f%%)" % min(pct, 100)
     marker_html = ""
@@ -841,6 +840,7 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None,
             note_cls = " pace-slow"
     note_html = '<span class="note%s">%s</span>' % (note_cls, html.escape(note)) if note else ""
     reset_txt = fmt_reset_page(cfg, reset)
+    reset_iso = reset.astimezone(datetime.timezone.utc).isoformat() if reset else ""
     fc = fill_class(pct)
     fill_cls = ("fill " + fc).strip()
     # the percentage picks up the same state colour as its bar, so a near-ceiling
@@ -863,7 +863,7 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None,
         label, reset_txt, " / " + note if note else "",
         " / 总量 " + quota_label if quota_label else "")
     return """
-    <div class="win" data-pct="%s" data-short="%s" data-reset-short="%s" data-capacity="%s" title="%s">
+    <div class="win" data-pct="%s" data-short="%s" data-reset-short="%s" data-reset-at="%s" data-capacity="%s" title="%s">
       <div class="win-head"><span>%s</span><span class="%s">%s</span></div>
       <div class="win-scale">
         <div class="bar"><div class="%s" style="width:%s"></div>%s</div>
@@ -872,7 +872,7 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None,
       %s
     </div>""" % ("" if pct is None else "%.1f" % pct, html.escape(label),
                  html.escape(reset_left(reset)),
-                 html.escape(quota_label), html.escape(title_txt),
+                 html.escape(reset_iso), html.escape(quota_label), html.escape(title_txt),
                  html.escape(label), pct_cls, pct_txt,
                  fill_cls, fill_width, marker_html,
                  html.escape(reset_txt), note_html, capacity_html)
@@ -1143,7 +1143,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <option value="comfy">横向图表</option><option value="compact">紧凑图表</option><option value="mini">极简单行</option>
     </select></div>
     <div class="set-row"><span>排序</span><select id="set-sort">
-      <option value="custom">自定义顺序</option><option value="usage">按用量高低（告急置顶）</option>
+      <option value="waste">按到期浪费风险（默认）</option><option value="usage">按用量高低（告急置顶）</option>
+      <option value="custom">自定义顺序</option>
     </select></div>
     <div class="set-row"><span>自动刷新</span><select id="set-refresh">
       <option value="0">关闭</option><option value="300">5分钟</option><option value="900">15分钟</option>
@@ -1176,7 +1177,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
               ['pace','节奏提示与时间刻度'], ['fetched','更新时间'], ['expiry','套餐到期'],
               ['summary','顶部摘要']];
   function defaults(){
-    return {v: 3, theme: 'auto', density: 'comfy', sort: 'custom', order: [], orderCustomized: false, hidden: [],
+    return {v: 4, theme: 'auto', density: 'comfy', sort: 'waste', order: [], orderCustomized: false, hidden: [],
             show: {badge: true, sub: true, reset: true, capacity: true, pace: true, fetched: true, expiry: true, summary: true},
             autoRefresh: 0};
   }
@@ -1186,9 +1187,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var raw = {};
     try { raw = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) {}
     S = defaults();
-    ['theme', 'density', 'sort', 'autoRefresh'].forEach(function(k){
+    ['theme', 'density', 'autoRefresh'].forEach(function(k){
       if (raw[k] !== undefined) S[k] = raw[k];
     });
+    // v4 introduces a new default sort. Existing browsers adopt it once;
+    // after the migration, the visitor's explicit choice is preserved.
+    if ((parseInt(raw.v, 10) || 0) >= 4 && raw.sort !== undefined) S.sort = raw.sort;
     // v3 intentionally resets the old saved order once. The server already
     // emits provider-grouped rows, but v1/v2 localStorage silently overrode
     // that DOM order and made same-provider accounts look scattered.
@@ -1217,6 +1221,32 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     return m;
   }
 
+  function wasteScore(card){
+    var best = -1, now = Date.now();
+    [].forEach.call(card.querySelectorAll('.win'), function(w){
+      var pct = parseFloat(w.getAttribute('data-pct'));
+      var resetAt = Date.parse(w.getAttribute('data-reset-at') || '');
+      if (isNaN(pct) || isNaN(resetAt)) return;
+      var remaining = Math.max(0, 100 - pct);
+      var hoursLeft = Math.max(1, (resetAt - now) / 3600000);
+      best = Math.max(best, remaining / hoursLeft);
+    });
+    return best;
+  }
+
+  function autoOrder(score){
+    var ordered = cards().slice(), providerBest = {};
+    ordered.forEach(function(c){
+      var provider = c.getAttribute('data-provider') || '';
+      providerBest[provider] = Math.max(providerBest[provider] === undefined ? -1 : providerBest[provider], score(c));
+    });
+    return ordered.sort(function(a, b){
+      var ap = a.getAttribute('data-provider') || '', bp = b.getAttribute('data-provider') || '';
+      if (ap === bp) return score(b) - score(a);
+      return providerBest[bp] - providerBest[ap];
+    });
+  }
+
   // Follow the server's provider-grouped DOM order until the visitor makes a
   // manual move. After that, new accounts land at the end; vanished ones drop.
   function syncOrder(){
@@ -1242,11 +1272,15 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     if (S.theme === 'dark') b.classList.add('theme-dark');
     else if (S.theme === 'light') b.classList.add('theme-light');
     SHOW.forEach(function(p){ b.classList.toggle('hide-' + p[0], !S.show[p[0]]); });
-    cards().forEach(function(c){
+    var ordered = cards().slice();
+    if (S.sort === 'waste') ordered = autoOrder(wasteScore);
+    else if (S.sort === 'usage') ordered = autoOrder(maxPct);
+    else ordered.sort(function(a, b){ return S.order.indexOf(acctOf(a)) - S.order.indexOf(acctOf(b)); });
+    ordered.forEach(function(c, i){
       var n = acctOf(c);
       c.classList.toggle('hidden', S.hidden.indexOf(n) >= 0);
       // visual order, so reordering never touches the DOM the refresh patches
-      c.style.order = (S.sort === 'usage') ? Math.round(1000 - maxPct(c)) : S.order.indexOf(n);
+      c.style.order = i;
     });
     renderSummary();
     arm(S.autoRefresh);
@@ -1312,8 +1346,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         var b = document.createElement('button');
         b.className = 'mini-btn';
         b.textContent = spec[0];
-        // manual order is meaningless while sorting by usage
-        b.disabled = spec[2] || S.sort === 'usage';
+        // manual order is meaningless while an automatic sort is active
+        b.disabled = spec[2] || S.sort !== 'custom';
         b.onclick = function(){
           var j = i + spec[1];
           var t = S.order[i]; S.order[i] = S.order[j]; S.order[j] = t;

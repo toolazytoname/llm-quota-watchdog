@@ -70,6 +70,15 @@ class QuotaScaleTests(unittest.TestCase):
         empty = q.window_html(cfg, "7天", 0, None)
         self.assertIn('style="width:0"', empty)
 
+    def test_window_exposes_machine_readable_reset_time(self):
+        cfg = dict(q.DEFAULTS)
+        cfg["_tz"] = datetime.timezone(datetime.timedelta(hours=8))
+        reset = datetime.datetime(2026, 8, 9, 12, 30, tzinfo=datetime.timezone.utc)
+        rendered = q.window_html(cfg, "7天", 25, reset)
+        self.assertIn('data-reset-at="2026-08-09T12:30:00+00:00"', rendered)
+        unknown = q.window_html(cfg, "7天", 25, None)
+        self.assertIn('data-reset-at=""', unknown)
+
     def test_longest_quota_window_is_rendered_first(self):
         cfg = dict(q.DEFAULTS)
         cfg["_tz"] = datetime.timezone(datetime.timedelta(hours=8))
@@ -119,11 +128,21 @@ class QuotaScaleTests(unittest.TestCase):
         self.assertIn('aria-label="拖动账号调整顺序"', rendered)
 
     def test_saved_order_migrates_to_provider_grouping_once(self):
-        self.assertIn("return {v: 3", q.PAGE_TEMPLATE)
+        self.assertIn("return {v: 4", q.PAGE_TEMPLATE)
         self.assertIn("orderCustomized: false", q.PAGE_TEMPLATE)
         self.assertIn("if (!S.orderCustomized)", q.PAGE_TEMPLATE)
         self.assertIn("S.order = names.slice()", q.PAGE_TEMPLATE)
         self.assertIn("S.orderCustomized = true", q.PAGE_TEMPLATE)
+
+    def test_expiry_waste_risk_is_the_default_sort(self):
+        self.assertIn("sort: 'waste'", q.PAGE_TEMPLATE)
+        self.assertIn('<option value="waste">按到期浪费风险（默认）</option>', q.PAGE_TEMPLATE)
+        self.assertIn("function wasteScore(card)", q.PAGE_TEMPLATE)
+        self.assertIn("function autoOrder(score)", q.PAGE_TEMPLATE)
+        self.assertIn("if (ap === bp) return score(b) - score(a)", q.PAGE_TEMPLATE)
+        self.assertIn("remaining / hoursLeft", q.PAGE_TEMPLATE)
+        self.assertIn("S.sort === 'waste'", q.PAGE_TEMPLATE)
+        self.assertIn("b.disabled = spec[2] || S.sort !== 'custom'", q.PAGE_TEMPLATE)
 
     def test_pointer_drag_does_not_capture_a_disabled_target(self):
         self.assertIn(".card.dragging { opacity: .45; pointer-events: none; }", q.PAGE_TEMPLATE)
