@@ -1,10 +1,29 @@
 import datetime
 import unittest
+from unittest import mock
 
 import quota_watchdog as q
 
 
 class QuotaScaleTests(unittest.TestCase):
+    def test_glm_weekly_bucket_is_kept_near_reset(self):
+        now = q.now_utc()
+        response = {
+            "data": {
+                "limits": [
+                    {"unit": 3, "number": 5, "usage": 2000, "currentValue": 486,
+                     "nextResetTime": int((now + datetime.timedelta(hours=4)).timestamp() * 1000)},
+                    {"unit": 6, "number": 1, "usage": 10000, "currentValue": 9960,
+                     "nextResetTime": int((now + datetime.timedelta(minutes=12)).timestamp() * 1000)},
+                ]
+            }
+        }
+        with mock.patch.object(q, "http_get", return_value=response):
+            windows = q.glm_quota("not-a-real-key")
+        self.assertEqual(set(windows), {"5h", "7d"})
+        self.assertAlmostEqual(windows["5h"][0], 24.3)
+        self.assertAlmostEqual(windows["7d"][0], 99.6)
+
     def test_default_layout_is_a_full_width_usage_chart(self):
         self.assertIn('id="chart-guide"', q.PAGE_TEMPLATE)
         self.assertIn('class="usage-axis"', q.PAGE_TEMPLATE)

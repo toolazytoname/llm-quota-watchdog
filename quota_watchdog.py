@@ -34,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
@@ -286,10 +286,12 @@ def glm_quota(api_key):
     """GLM Coding Plan (Zhipu). The Authorization header carries the API key
     directly — NO "Bearer " prefix, unlike Claude/Codex. Response data.limits[]
     has one entry per window; each window's reset is a millisecond epoch in
-    nextResetTime. Windows are classified by time-to-reset (same heuristic as
-    codex_quota) because the type/unit/number codes are undocumented and vary
-    by plan, and 'percentage' is an integer we recompute from used/total for
-    sub-integer precision.
+    nextResetTime. GLM's current Coding Plan response identifies its 5-hour
+    and weekly buckets as (unit, number) = (3, 5) and (6, 1). Prefer those
+    stable identifiers: time-to-reset alone misclassifies a weekly bucket as
+    5-hour during its final six hours. Unknown future shapes fall back to the
+    reset-time heuristic. 'percentage' is an integer we recompute from
+    used/total for sub-integer precision.
     """
     r = http_get("https://open.bigmodel.cn/api/monitor/usage/quota/limit", {
         "Authorization": api_key,
@@ -320,9 +322,16 @@ def glm_quota(api_key):
                 pass
         if pct is None:
             continue
-        # classify by time-to-reset: <6h -> 5h window, <8d -> weekly;
-        # anything longer (e.g. a ~30d MCP/monthly window) is not modeled here
-        if reset is not None:
+        # Prefer GLM's explicit bucket identifiers. In particular, a weekly
+        # window can have <6h left immediately before reset, which previously
+        # made it collide with the real 5h window and disappear from the page.
+        unit, number = item.get("unit"), item.get("number")
+        if unit == 3 and number == 5:
+            label = "5h"
+        elif unit == 6 and number == 1:
+            label = "7d"
+        # Unknown future shapes: classify by time-to-reset (<6h / <8d).
+        elif reset is not None:
             hrs = (reset - now).total_seconds() / 3600
             if hrs < 6:
                 label = "5h"
@@ -331,7 +340,7 @@ def glm_quota(api_key):
             else:
                 continue
         else:
-            label = "5h" if item.get("unit") == 3 else "7d"
+            label = "5h" if unit == 3 else "7d"
         if label not in out:
             out[label] = (pct, reset)
     return out
