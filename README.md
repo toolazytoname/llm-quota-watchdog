@@ -23,13 +23,15 @@ llm-quota-watchdog polls the same endpoints the official CLIs use, renders a sin
 
 ### Dashboard (static HTML, regenerate on cron)
 
-Per account: 5-hour / weekly / monthly (manual snapshot) progress bars with exact percentages, a time-progress marker on each bar, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. Dark theme, responsive multi-column grid that keeps even a long account list on one screen.
+Per account: 5-hour / weekly / monthly (manual snapshot) progress bars with exact percentages, a time-progress marker on each bar, reset countdowns, usage-vs-time pace (fast/slow), plan expiry countdown. The responsive full-width chart keeps every track comparable, adds cross-provider capacity tiers, and offers compact and mini views for long account lists.
 
 A one-line summary at the top tells you who to worry about right now: `5/5 healthy, fullest is Codex Pro weekly 100%, resets in 4d`. It turns amber when an account is close to its ceiling.
 
-![dashboard](docs/screenshot.png)
+![llm-quota-watchdog unified Claude Codex Kimi GLM quota dashboard](docs/screenshot.png)
 
-Two toolbar buttons:
+*Current horizontal dashboard in privacy mode, using demo data.*
+
+Alongside **refresh all**, the toolbar has two display controls:
 
 - **Privacy mode**: one click hides email subtitles, per-account fetch times, and the page timestamp for clean screenshots with no identifying info. Active only for the current tab (reloads clear), and the button turns amber so you remember to turn it off.
 - **Settings** — pure frontend, lives in the visitor's `localStorage`, needs no backend, doesn't change what anyone else sees:
@@ -44,7 +46,9 @@ Two toolbar buttons:
 | Auto refresh | off / 5 min – 3 h |
 | Backup | copy config / download file / paste-import / upload file, reset to defaults |
 
-![mini density](docs/screenshot-mini.png)
+![llm-quota-watchdog compact quota dashboard in mini density](docs/screenshot-mini.png)
+
+*Mini density keeps the same quota signals in a one-row-per-account overview.*
 
 > Sharing a screenshot but don't want your email in it? Use the "Privacy mode" toolbar button instead.
 
