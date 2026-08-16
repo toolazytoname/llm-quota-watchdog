@@ -3,7 +3,7 @@
 **One dashboard + smart push alerts for all your LLM coding-plan quotas and renewals.**
 Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan · Grok · Cursor
 
-[中文文档](README_CN.md)
+**Live dashboard:** [quota.weichao.studio](https://quota.weichao.studio/) · [中文文档](README_CN.md)
 
 Python 3.8+, **stdlib only, zero dependencies**. Static HTML output, no database, no daemon.
 

@@ -3,7 +3,7 @@
 **一个页面 + 智能推送，看住你所有大模型编程套餐的额度和到期日。**
 支持 Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan · Grok · Cursor
 
-[English](README.md)
+**在线演示：** [quota.weichao.studio](https://quota.weichao.studio/) · [English](README.md)
 
 Python 3.8+，**只用标准库，零依赖**。输出静态 HTML，无数据库、无守护进程。
 
