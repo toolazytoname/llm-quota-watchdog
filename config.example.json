@@ -3,6 +3,7 @@
   "bark_url_file": "",
   "ntfy_url": "",
   "ntfy_url_file": "",
+  "mode": "quota",
   "page_title": "大模型额度监控",
   "cliproxyapi_auth_dir": "~/.cli-proxy-api",
   "cliproxyapi_management_key_file": "",
@@ -32,11 +33,30 @@
         "7d": "60,000 credits / 周"
       },
       "api_key_file": "~/.config/llm-quota-watchdog/glm-key"
+    },
+    {
+      "type": "cursor",
+      "label": "Cursor Ultra",
+      "sub": "$200/mo",
+      "started_at": "2026-08-13",
+      "expires_at": "2026-09-13",
+      "period": "monthly"
+    },
+    {
+      "type": "grok",
+      "label": "Grok Bot",
+      "started_at": "2026-08-15",
+      "expires_at": "2026-08-22"
+    },
+    {
+      "type": "grok",
+      "label": "Grok",
+      "expires_at": "2026-08-19T20:12:00"
     }
   ],
   "relaxed_accounts": [],
   "plan_expiry": {
-    "Kimi Coding": "2026-08-22"
+    "Kimi Coding": "2027-07-23"
   },
   "monthly_snapshot": {
     "Kimi Coding": { "pct": 21.4, "reset": "2026-08-22", "updated": "2026-07-29" }

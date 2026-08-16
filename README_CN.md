@@ -1,7 +1,7 @@
 # llm-quota-watchdog
 
-**一个页面 + 智能推送，看住你所有大模型编程套餐的额度。**
-支持 Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan
+**一个页面 + 智能推送，看住你所有大模型编程套餐的额度和到期日。**
+支持 Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan · Grok · Cursor
 
 [English](README.md)
 
@@ -18,6 +18,8 @@ Python 3.8+，**只用标准库，零依赖**。输出静态 HTML，无数据库
 - Kimi for Coding 根本没有文档化的额度 API（本项目的接口是从 kimi-cli 源码里挖出来的）。
 
 llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态页面，并在你烧穿窗口之前——或者浪费窗口之前——推送提醒。
+
+不想碰各家 token、只想盯着套餐还剩几天？把配置里的 `mode` 改成 `"time"`：页面还是原来那些卡片和进度条，但条上走的是**已经过了多久 / 还剩几天**，一次上游额度接口都不会打。Grok、Cursor 这类本来就没有公开额度 API 的套餐，也走这条路径。
 
 ## 功能
 
@@ -63,7 +65,7 @@ llm-quota-watchdog 调用官方 CLI 自己使用的接口，生成一个静态�
 | ⏱ 节奏指示 | 每个窗口都显示时间进度 vs 用量，偏快偏慢一眼可见 |
 | 🟡 赶紧用 | 时间过半但用量落后 30 点 · 或 ≤26 小时重置且用量 ≤60% |
 | 🟢 满血复活 | 检测到窗口重置（用量掉 30 点以上） |
-| 📅 套餐到期 | 手动配置的到期日前 7/3/1 天 |
+| 📅 套餐到期 | 手动配置的到期日前 7/3/1 天；时间模式还会推「哪个快到期、还剩几天」 |
 | 📊 每日汇总 | 每天一条完整报告，无论有无异常 |
 
 每条告警**一个周期只推一次**（状态文件去重），不刷屏。
@@ -120,6 +122,8 @@ curl -fsSL https://raw.githubusercontent.com/toolazytoname/llm-quota-watchdog/ma
 ```bash
 llm-quota-watchdog watchdog --summary --config ~/.local/share/llm-quota-watchdog/config.json
 llm-quota-watchdog page --config ~/.local/share/llm-quota-watchdog/config.json
+llm-quota-watchdog serve --config ~/.local/share/llm-quota-watchdog/config.json
+# 默认 http://127.0.0.1:8791/ ；页面上改日期会 POST /dates 写回这份 config.json
 ```
 
 用任意 Web 服务器托管页面，比如 nginx：
@@ -145,11 +149,12 @@ location /quota/ {
 |---|---|
 | `bark_url` / `ntfy_url` | 推送通道，可配任一或都配 |
 | `bark_url_file` / `ntfy_url_file` | 同上，但从文件读（key 不落进 config.json），配了文件就以文件为准 |
+| `mode` | `quota`（默认，拉各家额度）或 `time`（只记时间，不打上游用量接口） |
 | `page_title` | 页面标题，默认「大模型额度监控」 |
 | `cliproxyapi_auth_dir` | CLIProxyAPI 的 OAuth `*.json` 目录，Claude/Codex 自动发现 |
-| `accounts` | 显式账号列表，也决定卡片默认顺序。每项可配 `label`（卡片标题）、`sub`（副标题，如邮箱或套餐档位）、`quota_factor`（同供应商真实倍率）、`capacity_index`（跨平台近似容量指数）、`quota_label`/`quota_labels`（原生额度文案）、`api_key`/`api_key_file`（Kimi/GLM）或 `auth_file`（Claude/Codex） |
+| `accounts` | 显式账号列表，也决定卡片默认顺序。额度账号可配 `label` / `sub` / `quota_factor` / `capacity_index` / `quota_label` / `api_key_file` / `auth_file`。时间账号用 `type: "time"|"grok"|"cursor"`（或任意账号加 `"track": "time"`），再配 `started_at`、`expires_at`、可选 `period`（`monthly` / `yearly` / 天数） |
 | `relaxed_accounts` | 只保留"快用完"告警的账号标签 |
-| `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → 页面倒计时 + 到期提醒（key 用账号 label） |
+| `plan_expiry` | `{"Kimi Coding": "2027-07-23"}` → 页面倒计时 + 到期提醒（key 用账号 label） |
 | `monthly_snapshot` | 月度配额快照，显示在页面上（key 用账号 label）；没配 `monthly_web_token_file` 的账号需手动维护，配了的会自动刷新 |
 | `thresholds` | 所有告警阈值都可调 |
 | `timezone_offset_hours` | 显示/报告时区（默认 UTC+8） |
@@ -158,6 +163,32 @@ location /quota/ {
 | `cliproxyapi_management_url` | CLIProxyAPI 管理 API 地址，默认 `http://127.0.0.1:8317/v0/management/auth-files` |
 
 `accounts` 留空也能跑：Claude/Codex 会从 `cliproxyapi_auth_dir` 自动发现，卡片标题就是认证文件名。想要好看的标题和副标题，再显式写进 `accounts` 即可——显式配过的认证文件不会被重复自动发现，所以两个 Codex 账号只写一个也不会漏掉另一个。
+
+## 时间模式（不记额度，只记到期）
+
+额度接口都要带 token。如果你担心轮询本身增加封号风险，或者套餐根本没有公开额度 API（Grok、Cursor），用时间模式：
+
+```json
+"mode": "time",
+"accounts": [
+  {
+    "type": "cursor",
+    "label": "Cursor Ultra",
+    "sub": "$200/mo",
+    "started_at": "2026-08-13",
+    "expires_at": "2026-09-13",
+    "period": "monthly"
+  }
+]
+```
+
+- 页面还是原来的卡片 + 进度条，条表示**已经过了多久**，旁边写「已过 N 天 · 还剩 M 天」
+- 每张计时卡有「改日期」，顶栏有「添加 / 改日期」。点保存写入本地 `config.json`；配置了 `BLOB_READ_WRITE_TOKEN` 时同时写入 Vercel Blob，换设备也能读到
+- `watchdog` / `page` **不会**请求任何上游用量接口，也不会去扫 CLIProxyAPI 认证目录
+- 推送只剩到期类：到期前 7 / 3 / 1 天各一次（「还有 N 天到期」），过期当天补一条「已到期」；配了 `period` 但没写 `expires_at` 时，按当前计费周期结束来推
+- 也可以不改全局 `mode`，只给某几个账号写 `"type": "grok"` / `"type": "cursor"` / `"track": "time"`，和额度卡片混在同一页
+
+`period` 为 `monthly` / `yearly` / 整数天数时，卡片跟的是**当前这一期**（比如每月 15 号续上 15 号）。`expires_at` 是整段订阅的硬截止日期；有硬截止日时，推送盯这个日期，避免月付套餐每个月底都来一条「周期结束」。
 
 所有使用率轨道都保持满宽，只表达 0–100% 的已用比例，因此小套餐不会再被压成难以辨认的短线。`quota_factor` 表示**同一供应商内的真实额度倍率，不是价格倍率**。`capacity_index` 是把不同供应商放在一起的人工近似指数，并不把 Codex messages、GLM credits 和 Kimi units 伪装成同一种 token；未配置原生额度文案时，页面会明确显示“跨平台≈N×”。套餐体量在轨道旁用三级短标识帮助扫视（不高于 1×、不高于 6×、高于 6×），同时保留配置中的准确倍率或原生额度文案。每个账号会把可用的最长周期排在最前面。`quota_label` 用于通用原生额度文案；如果 5 小时与周窗口的绝对数不同，用 `quota_labels: {"5h": "12,000 credits / 5小时", "7d": "60,000 credits / 周"}` 分别显示。
 
@@ -252,7 +283,7 @@ location = /refresh {
 ## 常见问题
 
 **轮询这些接口会增加封号风险吗？**
-这些接口就是官方 CLI 自己调的，每小时一次、来自你正常流量的同一个 IP，和官方客户端行为一致。不过要说明：通过任何第三方代理使用订阅 OAuth token 本身就超出厂商设计用途——那是你现有用法固有的风险，这个工具不会明显增加它。
+这些接口就是官方 CLI 自己调的，每小时一次、来自你正常流量的同一个 IP，和官方客户端行为一致。不过要说明：通过任何第三方代理使用订阅 OAuth token 本身就超出厂商设计用途——那是你现有用法固有的风险，这个工具不会明显增加它。想完全避开用量接口，把 `mode` 设为 `"time"`，只记开始/到期日。
 
 **为什么我的 Codex 账号只有周窗口？**
 Plus/ProLite 套餐的 `wham/usage` 把周限额放在 `primary_window` 返回。工具按实际重置时长标注窗口，你看到的就是你套餐真实的样子。

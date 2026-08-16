@@ -1,0 +1,41 @@
+{
+  "mode": "time",
+  "page_title": "大模型套餐监控",
+  "accounts": [
+    {
+      "type": "cursor",
+      "label": "Cursor Ultra",
+      "sub": "$200/mo",
+      "started_at": "2026-08-13",
+      "expires_at": "2026-09-13",
+      "period": "monthly"
+    },
+    {
+      "type": "grok",
+      "label": "Grok Bot",
+      "started_at": "2026-08-15",
+      "expires_at": "2026-08-22"
+    },
+    {
+      "type": "grok",
+      "label": "Grok",
+      "expires_at": "2026-08-19T20:12:00"
+    },
+    {
+      "type": "time",
+      "label": "Kimi K3",
+      "sub": "月度周期",
+      "started_at": "2026-07-22",
+      "expires_at": "2026-08-22",
+      "period": "monthly"
+    },
+    {
+      "type": "time",
+      "label": "OpenAI",
+      "sub": "Resets 8月19日 21:38",
+      "expires_at": "2026-08-19T21:38:00"
+    }
+  ],
+  "timezone_offset_hours": 8,
+  "page_out_dir": "./www"
+}

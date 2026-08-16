@@ -7,6 +7,16 @@ Supported providers:
   - Codex Plus/Pro   (via CLIProxyAPI OAuth auth file -> chatgpt.com/backend-api/wham/usage)
   - Kimi for Coding  (via API key -> api.kimi.com/coding/v1/usages)
   - GLM Coding Plan  (via API key -> open.bigmodel.cn/api/monitor/usage/quota/limit)
+  - Grok / Cursor / generic time accounts (local dates only — no vendor API)
+
+Two dashboard modes (config key ``mode``):
+  quota   default; poll provider usage endpoints as before
+  time    conservative: never call a vendor usage API. Each card is a
+          subscription-period bar (how long has elapsed / how many days left).
+          Push alerts cover plan expiry and "N days left in this cycle".
+
+A single account can also opt out of polling with ``"type": "time"|"grok"|"cursor"``
+or ``"track": "time"`` even when the rest of the dashboard stays in quota mode.
 
 Subcommands:
   watchdog             check quotas, push alerts only when rules trigger
@@ -15,6 +25,8 @@ Subcommands:
   page --account LBL   only re-query that account, serve the rest from the page
                         cache (repeatable) — this is what the per-card refresh
                         button on the dashboard is meant to call
+  serve                local HTTP server: static page + /refresh + POST /dates
+                        (writes start/expiry back into config.json; 127.0.0.1)
   check-auth           optional: push when CLIProxyAPI auth-file health changes
                         (only does anything if cliproxyapi_management_key_file is
                         set in config; run this from its own low-frequency cron
@@ -27,6 +39,7 @@ import argparse
 import calendar
 import datetime
 import html
+import http.server
 import json
 import math
 import os
@@ -34,13 +47,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.7.2"
+VERSION = "1.10.0"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
     "bark_url_file": "",            # ...or keep the key out of config.json, in a chmod-600 file
     "ntfy_url": "",                 # e.g. https://ntfy.sh/your-topic (optional)
     "ntfy_url_file": "",
+    "mode": "quota",                # "quota" (poll usage APIs) or "time" (local dates only)
     "cliproxyapi_auth_dir": "~/.cli-proxy-api",
     "cliproxyapi_management_key_file": "",   # optional: enables auth-file health checks
     "cliproxyapi_management_url": "http://127.0.0.1:8317/v0/management/auth-files",
@@ -92,6 +106,7 @@ def load_config(path):
         cfg["monthly_live_file"] = os.path.join(
             os.path.dirname(cfg["state_file"]) or ".", "quota-monthly-live.json")
     cfg["_tz"] = datetime.timezone(datetime.timedelta(hours=cfg["timezone_offset_hours"]))
+    cfg["_config_path"] = os.path.abspath(os.path.expanduser(path)) if path else ""
     for k in ("state_file", "page_state_file", "page_out_dir", "log_file", "monthly_live_file"):
         cfg[k] = os.path.expanduser(cfg[k])
     # auto-refreshed monthly snapshots (see refresh_monthly_from_web) take priority
@@ -182,6 +197,158 @@ def save_json_file(path, data):
     with open(tmp, "w") as f:
         json.dump(data, f)
     os.replace(tmp, path)
+
+
+def save_json_pretty(path, data):
+    """Atomic pretty-print write for the human-edited config.json."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+BLOB_PATHNAME = "quota-watchdog-dates.json"
+BLOB_API = "https://blob.vercel-storage.com"
+
+
+def blob_token():
+    return (os.environ.get("BLOB_READ_WRITE_TOKEN") or "").strip()
+
+
+def accounts_public(accounts):
+    """Date / used_up fields only — never api keys."""
+    out = []
+    for acc in accounts or []:
+        if not isinstance(acc, dict) or not acc.get("label"):
+            continue
+        row = {"label": acc["label"], "type": acc.get("type") or "time"}
+        for key in TIME_RECORD_FIELDS:
+            if acc.get(key):
+                row[key] = acc[key]
+        if acc.get("used_up"):
+            row["used_up"] = True
+        out.append(row)
+    return out
+
+
+def blob_headers(extra=None):
+    headers = {
+        "authorization": "Bearer " + blob_token(),
+        "x-api-version": "12",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def blob_get_json(pathname=BLOB_PATHNAME):
+    """Return parsed JSON from a private blob, or None if missing / no token."""
+    if not blob_token():
+        return None
+    url = BLOB_API.rstrip("/") + "/" + urllib.parse.quote(pathname, safe="/")
+    req = urllib.request.Request(url, headers=blob_headers())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 400):
+            return None
+        raise
+    except (ValueError, OSError):
+        return None
+
+
+def blob_put_json(data, pathname=BLOB_PATHNAME):
+    if not blob_token():
+        raise ValueError("未配置 BLOB_READ_WRITE_TOKEN")
+    body = json.dumps(data, ensure_ascii=False).encode()
+    url = BLOB_API.rstrip("/") + "/?" + urllib.parse.urlencode({"pathname": pathname})
+    headers = blob_headers({
+        "x-vercel-blob-access": "private",
+        "x-content-type": "application/json",
+        "x-add-random-suffix": "0",
+        "x-allow-overwrite": "1",
+        "x-cache-control-max-age": "60",
+        "content-type": "application/json",
+    })
+    req = urllib.request.Request(url, data=body, headers=headers, method="PUT")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp)
+
+
+def merge_store_accounts(user, overlay_accounts):
+    """Overlay start/expiry/used_up from the cloud store onto config accounts."""
+    by_label = {}
+    for acc in overlay_accounts or []:
+        if isinstance(acc, dict) and acc.get("label"):
+            by_label[acc["label"]] = acc
+    accounts = list(user.get("accounts") or [])
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        overlay = by_label.pop(acc.get("label"), None)
+        if not overlay:
+            continue
+        for key in TIME_RECORD_FIELDS:
+            if overlay.get(key):
+                acc[key] = overlay[key]
+            elif key in overlay:
+                acc.pop(key, None)
+        if overlay.get("used_up"):
+            acc["used_up"] = True
+        else:
+            acc.pop("used_up", None)
+    for leftover in by_label.values():
+        accounts.append(dict(leftover))
+    user["accounts"] = accounts
+    return user
+
+
+def load_user_config(config_path):
+    path = os.path.expanduser(config_path)
+    if os.path.exists(path):
+        with open(path) as f:
+            user = json.load(f)
+        if not isinstance(user, dict):
+            raise ValueError("config.json 不是对象")
+    else:
+        user = {}
+    if not isinstance(user.get("accounts"), list):
+        user["accounts"] = list(user.get("accounts") or [])
+    blob = blob_get_json()
+    if blob and isinstance(blob.get("accounts"), list):
+        merge_store_accounts(user, blob["accounts"])
+        user["_store"] = "blob"
+    else:
+        user["_store"] = "config"
+        if blob_token() and user.get("accounts"):
+            try:
+                blob_put_json({"accounts": accounts_public(user["accounts"])})
+                user["_store"] = "blob"
+            except Exception:
+                pass
+    return user
+
+
+def persist_user_config(config_path, user):
+    payload = dict(user)
+    payload.pop("_store", None)
+    accounts = payload.get("accounts") or []
+    store = "config"
+    if blob_token():
+        blob_put_json({"accounts": accounts_public(accounts)})
+        store = "blob"
+    path = os.path.expanduser(config_path)
+    try:
+        save_json_pretty(path, payload)
+    except OSError:
+        if store != "blob":
+            raise
+    return store
 
 
 def load_state(cfg):
@@ -365,8 +532,9 @@ def account_list(cfg):
     """
     accounts = []
     claimed = set()
+    known = QUOTA_ACCOUNT_TYPES + TIME_ACCOUNT_TYPES
     for acc in cfg.get("accounts") or []:
-        if acc.get("type") not in ("claude", "codex", "kimi", "glm"):
+        if acc.get("type") not in known:
             continue
         entry = dict(acc)
         entry["label"] = acc.get("label") or acc["type"]
@@ -374,6 +542,10 @@ def account_list(cfg):
             entry["auth_file"] = os.path.expanduser(acc["auth_file"])
             claimed.add(os.path.basename(entry["auth_file"]))
         accounts.append(entry)
+
+    # Time mode is the conservative path: never even look at OAuth files.
+    if dashboard_mode(cfg) == "time":
+        return accounts
 
     auth_dir = os.path.expanduser(cfg.get("cliproxyapi_auth_dir") or "")
     if auth_dir and os.path.isdir(auth_dir):
@@ -399,6 +571,8 @@ def fetch_one(cfg, acct):
     """Query one account's quota. Never raises — a dead account comes back as
     {"error": ..., "error_kind": ...} so it can't blank out everyone else's card.
     Returns None when the account isn't usable at all (no key configured)."""
+    if is_time_account(cfg, acct):
+        return None
     t = acct.get("type")
     try:
         if t in ("kimi", "glm"):
@@ -435,6 +609,8 @@ def collect(cfg):
     """
     results = {}
     for acct in account_list(cfg):
+        if is_time_account(cfg, acct):
+            continue
         r = fetch_one(cfg, acct)
         if r is None:
             continue
@@ -506,6 +682,385 @@ def month_before(dt):
         m, y = 12, y - 1
     day = min(dt.day, calendar.monthrange(y, m)[1])
     return dt.replace(year=y, month=m, day=day)
+
+
+# ---------------------------------------------------------------- time mode
+# Conservative path: no vendor usage API, just subscription / billing dates.
+
+TIME_ACCOUNT_TYPES = ("time", "grok", "cursor")
+QUOTA_ACCOUNT_TYPES = ("claude", "codex", "kimi", "glm")
+
+
+def dashboard_mode(cfg):
+    mode = (cfg.get("mode") or "quota").strip().lower()
+    return "time" if mode == "time" else "quota"
+
+
+def is_time_account(cfg, acct):
+    """True when this card must never hit a vendor usage endpoint."""
+    if (acct.get("track") or "").strip().lower() == "time":
+        return True
+    if (acct.get("type") or "") in TIME_ACCOUNT_TYPES:
+        return True
+    return dashboard_mode(cfg) == "time"
+
+
+def parse_local_date(cfg, value):
+    """Parse YYYY-MM-DD or a local datetime (``2026-08-19T20:12``) into tz-aware."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    tz = cfg["_tz"]
+    if "T" in s or (len(s) > 10 and " " in s[10:]):
+        raw = s.replace(" ", "T", 1)
+        # fromisoformat accepts HH:MM on 3.11+, but pad seconds for older 3.8–3.10
+        date_part, _, time_part = raw.partition("T")
+        time_core = time_part.split("+", 1)[0].split("-", 1)[0].split("Z", 1)[0]
+        if time_core.count(":") == 1:
+            raw = raw.replace(time_core, time_core + ":00", 1)
+        dt = parse_ts(raw)
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=tz)
+        return dt.astimezone(tz)
+    try:
+        d = datetime.date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+    return datetime.datetime(d.year, d.month, d.day, tzinfo=tz)
+
+
+def add_calendar_months(dt, months, ref_day=None):
+    """Shift dt by N calendar months, keeping the original day-of-month when
+    the target month is long enough (Jan 31 → Feb 28 → Mar 31)."""
+    day = dt.day if ref_day is None else ref_day
+    y = dt.year + (dt.month - 1 + months) // 12
+    m = (dt.month - 1 + months) % 12 + 1
+    day = min(day, calendar.monthrange(y, m)[1])
+    return dt.replace(year=y, month=m, day=day)
+
+
+def cycle_bounds(started, now, period):
+    """Current billing window containing ``now``.
+
+    ``period`` is ``monthly``, ``yearly``, or an integer number of days.
+    Windows walk forward from ``started`` so a monthly sub bought on the 15th
+    always rolls 15th→15th. Returns None when period is unset/invalid.
+    """
+    if started is None or now is None or period in (None, "", "none"):
+        return None
+    if period == "monthly":
+        step = 1
+    elif period == "yearly":
+        step = 12
+    else:
+        try:
+            days = int(period)
+        except (TypeError, ValueError):
+            return None
+        if days <= 0:
+            return None
+        delta = datetime.timedelta(days=days)
+        start = started
+        # 4000 days-windows covers ~10 years of 1-day periods
+        for _ in range(4000):
+            end = start + delta
+            if now < end:
+                return start, end
+            start = end
+        return start, start + delta
+    ref_day = started.day
+    for n in range(0, 240):
+        start = add_calendar_months(started, n * step, ref_day)
+        end = add_calendar_months(started, (n + 1) * step, ref_day)
+        if now < end:
+            return start, end
+    start = add_calendar_months(started, 240 * step, ref_day)
+    return start, add_calendar_months(started, 241 * step, ref_day)
+
+
+def account_expiry_dt(cfg, acct):
+    raw = acct.get("expires_at") or (cfg.get("plan_expiry") or {}).get(acct.get("label"))
+    return parse_local_date(cfg, raw)
+
+
+def infer_window_start(end, period):
+    """Start instant of the cycle that ends at ``end``. Same clock time, no
+    7-vs-30 switching — the bar percent is elapsed/total of this window."""
+    if end is None:
+        return None
+    if period == "monthly":
+        return add_calendar_months(end, -1, end.day)
+    if period == "yearly":
+        return add_calendar_months(end, -12, end.day)
+    try:
+        days = int(period)
+    except (TypeError, ValueError):
+        days = 0
+    if days > 0:
+        return end - datetime.timedelta(days=days)
+    return end - datetime.timedelta(days=7)
+
+
+def fmt_span_days(days):
+    """Format a real (possibly fractional) day count so it matches the bar %."""
+    if days is None:
+        return "?"
+    days = float(days)
+    if days < 0:
+        days = 0.0
+    hours = days * 24.0
+    if hours < 1:
+        return "%d 分钟" % max(1, int(round(hours * 60)))
+    if days < 1:
+        return "%.1f 小时" % hours
+    if days >= 10 and abs(days - round(days)) < 0.05:
+        return "%d 天" % int(round(days))
+    return "%.1f 天" % days
+
+
+def account_time_window(cfg, acct):
+    """Elapsed / remaining time for one subscription card. All local, no I/O.
+
+    The bar percent, elapsed days and remaining days all come from the same
+    timestamps: (now - start) / (end - start). Calendar-day rounding is not
+    used, so "已过 3.2 天" and a 10.3% fill cannot disagree.
+    """
+    now = now_utc().astimezone(cfg["_tz"])
+    started = parse_local_date(cfg, acct.get("started_at"))
+    expires = account_expiry_dt(cfg, acct)
+    start, end = started, expires
+    if started and acct.get("period"):
+        bounds = cycle_bounds(started, now, acct.get("period"))
+        if bounds:
+            start, end = bounds
+            if expires and end > expires:
+                end = expires
+            if expires and start >= expires:
+                start, end = started, expires
+    if start is None and end is not None:
+        start = infer_window_start(end, acct.get("period"))
+    if start is None and end is None:
+        return None
+    expired = bool(end and now >= end)
+    total = (end - start).total_seconds() if (start and end) else None
+    if total and total > 0:
+        elapsed_sec = (min(now, end) - start).total_seconds() if expired else (now - start).total_seconds()
+        elapsed_pct = 100.0 if expired else min(max(elapsed_sec / total * 100.0, 0.0), 100.0)
+        elapsed_days = max(0.0, elapsed_sec / 86400.0)
+        remaining_days = 0.0 if expired else max(0.0, (end - now).total_seconds() / 86400.0)
+        total_days = total / 86400.0
+    elif expired:
+        elapsed_pct = 100.0
+        elapsed_days = 0.0
+        remaining_days = 0.0
+        total_days = None
+    elif start is None:
+        elapsed_pct = None
+        elapsed_days = 0.0
+        remaining_days = (end - now).total_seconds() / 86400.0 if end else None
+        total_days = None
+    else:
+        elapsed_pct = 0.0
+        elapsed_days = max(0.0, (now - start).total_seconds() / 86400.0)
+        remaining_days = None
+        total_days = None
+    overdue_days = 0.0
+    if expired and end:
+        overdue_days = max(0.0, (now - end).total_seconds() / 86400.0)
+    return {
+        "start": start,
+        "end": end,
+        "elapsed_pct": elapsed_pct,
+        "elapsed_days": elapsed_days,
+        "remaining_days": remaining_days,
+        "overdue_days": overdue_days,
+        "total_days": total_days,
+        "expired": expired,
+    }
+
+
+def time_fill_class(tw):
+    """Colour a time bar by days left, not by elapsed % — a yearly sub at 75%
+    elapsed is not urgent, 3 days left is."""
+    if not tw:
+        return ""
+    if tw["expired"] or (tw.get("remaining_days") is not None and tw["remaining_days"] <= 1):
+        return "crit"
+    if tw.get("remaining_days") is not None and tw["remaining_days"] <= 7:
+        return "high"
+    return ""
+
+
+def time_window_label(acct):
+    period = acct.get("period")
+    if period == "monthly":
+        return "本月周期"
+    if period == "yearly":
+        return "本年周期"
+    try:
+        days = int(period)
+    except (TypeError, ValueError):
+        days = None
+    if days:
+        return "%d天周期" % days
+    return "套餐周期"
+
+
+def fmt_time_summary_line(cfg, acct):
+    tw = account_time_window(cfg, acct)
+    label = acct.get("label") or acct.get("type") or "account"
+    if not tw:
+        return "%s: 未配置开始/到期日" % label
+    if acct.get("used_up"):
+        end_txt = tw["end"].date().isoformat() if tw["end"] else "?"
+        return "%s: 已打勾用完（%s）" % (label, end_txt)
+    end_txt = tw["end"].date().isoformat() if tw["end"] else "?"
+    if tw["expired"]:
+        if tw["overdue_days"]:
+            return "%s: 已过期 %s（%s）" % (label, fmt_span_days(tw["overdue_days"]), end_txt)
+        return "%s: 已到期（%s）" % (label, end_txt)
+    if tw["remaining_days"] is None:
+        return "%s: 已过 %s" % (label, fmt_span_days(tw["elapsed_days"]))
+    return "%s: 已过 %s / 还剩 %s（%s到期）" % (
+        label, fmt_span_days(tw["elapsed_days"]),
+        fmt_span_days(tw["remaining_days"]), end_txt)
+
+
+def iter_named_expiry(cfg, accounts):
+    """Unique (name, YYYY-MM-DD, kind) rows the expiry pusher should watch.
+
+    Subscription ``expires_at`` / ``plan_expiry`` always win. A rolling
+    ``period`` cycle is only pushed when the account has no hard end date —
+    otherwise a yearly prepaid plan would get a "cycle ending" ping every month.
+    """
+    seen = set()
+    out = []
+
+    def add(name, raw, kind):
+        dt = parse_local_date(cfg, raw)
+        if not dt or not name:
+            return
+        key = (name, dt.date().isoformat())
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((name, dt.date().isoformat(), kind))
+
+    for acct in accounts:
+        label = acct.get("label") or acct.get("type")
+        if acct.get("expires_at"):
+            add(label, acct["expires_at"], "套餐到期")
+        elif is_time_account(cfg, acct):
+            tw = account_time_window(cfg, acct)
+            if tw and tw["end"] and not tw["expired"]:
+                add(label, tw["end"].date().isoformat(), "周期结束")
+    for name, date_str in (cfg.get("plan_expiry") or {}).items():
+        add(name, date_str, "套餐到期")
+    return out
+
+
+TIME_RECORD_FIELDS = ("started_at", "expires_at", "period", "sub")
+
+
+def normalize_time_record(cfg, payload):
+    """Validate a POST /dates body. Never accepts credentials."""
+    if not isinstance(payload, dict):
+        raise ValueError("JSON 不对")
+    label = (payload.get("label") or "").strip()
+    if not label:
+        raise ValueError("缺少名称")
+    if len(label) > 80:
+        raise ValueError("名称太长")
+    rec = {"label": label}
+    if payload.get("delete"):
+        rec["delete"] = True
+        return rec
+    if "used_up" in payload:
+        rec["used_up"] = _as_bool(payload.get("used_up"))
+    for key in TIME_RECORD_FIELDS:
+        if key not in payload:
+            continue
+        raw = payload.get(key, "")
+        rec[key] = "" if raw is None else str(raw).strip()
+    for key in ("started_at", "expires_at"):
+        if rec.get(key) and parse_local_date(cfg, rec[key]) is None:
+            raise ValueError("日期格式不对: " + key)
+    period = rec.get("period") or ""
+    if period and period not in ("monthly", "yearly"):
+        try:
+            days = int(period)
+        except ValueError:
+            raise ValueError("周期不对")
+        if days <= 0 or days > 3660:
+            raise ValueError("周期不对")
+        rec["period"] = str(days)
+    return rec
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def apply_time_record(config_path, rec):
+    """Write start/expiry onto one account in config.json.
+
+    Only touches label / type / date fields. Existing api_key, api_key_file
+    and auth_file values are left alone. New accounts are appended as
+    ``type: time``. Deleting is limited to time-only cards with no credentials.
+    """
+    user = load_user_config(config_path)
+    accounts = user.setdefault("accounts", [])
+    if not isinstance(accounts, list):
+        raise ValueError("accounts 不是列表")
+    label = rec["label"]
+    found = None
+    for acc in accounts:
+        if isinstance(acc, dict) and acc.get("label") == label:
+            found = acc
+            break
+    if rec.get("delete"):
+        if found is None:
+            raise ValueError("没有这张卡")
+        is_time = (found.get("type") in TIME_ACCOUNT_TYPES
+                   or found.get("track") == "time")
+        if not is_time:
+            raise ValueError("这张卡不是计时卡，不能从页面删除")
+        if found.get("api_key") or found.get("api_key_file") or found.get("auth_file"):
+            raise ValueError("带凭据的账号不能从页面删除")
+        accounts.remove(found)
+        persist_user_config(config_path, user)
+        return {"ok": True, "deleted": label}
+    if found is None:
+        found = {"type": "time", "label": label}
+        accounts.append(found)
+    if "used_up" in rec:
+        if rec["used_up"]:
+            found["used_up"] = True
+        else:
+            found.pop("used_up", None)
+    for key in TIME_RECORD_FIELDS:
+        if key not in rec:
+            continue
+        if rec[key]:
+            found[key] = rec[key]
+        else:
+            found.pop(key, None)
+    persist_user_config(config_path, user)
+    public = {"type": found.get("type") or "time", "label": label}
+    for key in TIME_RECORD_FIELDS:
+        if found.get(key):
+            public[key] = found[key]
+    if found.get("used_up"):
+        public["used_up"] = True
+    return {"ok": True, "account": public}
 
 def monthly_pace(pct, reset):
     """Same as pace_info but for a manually-snapshotted monthly quota, whose
@@ -581,11 +1136,14 @@ def refresh_monthly_from_web(cfg, state):
 
 def cmd_watchdog(cfg, summary_mode):
     th = cfg["thresholds"]
-    results = collect(cfg)
+    accounts = account_list(cfg)
+    # Time mode never touches a vendor usage or monthly-quota endpoint.
+    results = {} if dashboard_mode(cfg) == "time" else collect(cfg)
 
     state = load_state(cfg)
     alerts = []
-    alerts.extend(refresh_monthly_from_web(cfg, state))
+    if dashboard_mode(cfg) != "time":
+        alerts.extend(refresh_monthly_from_web(cfg, state))
     now = now_utc()
     today = now.astimezone(cfg["_tz"]).date().isoformat()
     relaxed = set(cfg.get("relaxed_accounts") or [])
@@ -649,16 +1207,27 @@ def cmd_watchdog(cfg, summary_mode):
                                   % (acct, fmt_pct(pct), round(hours_left)))
                     state[w2key] = True
 
-    # plan expiry reminders
-    for name, date_str in (cfg.get("plan_expiry") or {}).items():
-        exp = parse_ts(str(date_str) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
+    # plan / cycle expiry reminders (subscription end dates + time-mode cycles)
+    for name, date_str, kind in iter_named_expiry(cfg, accounts):
+        exp = parse_local_date(cfg, date_str)
         if exp is None:
             continue
         days_left = (exp.date() - now.astimezone(cfg["_tz"]).date()).days
+        if days_left < 0:
+            ekey = "expired|%s|%s" % (name, date_str)
+            if not state.get(ekey):
+                alerts.append("【已到期】%s 套餐已于 %s 到期" % (name, date_str))
+                state[ekey] = True
+            continue
         for d in th["expiry_alert_days"]:
             ekey = "expiry|%s|%s|%d" % (name, date_str, d)
             if days_left <= d and not state.get(ekey):
-                alerts.append("【套餐到期】%s 套餐还有 %d 天到期（%s）" % (name, max(days_left, 0), date_str))
+                if kind == "周期结束":
+                    alerts.append("【快到期】%s 本周期还剩 %d 天（%s 结束）"
+                                  % (name, days_left, date_str))
+                else:
+                    alerts.append("【套餐到期】%s 套餐还有 %d 天到期（%s）"
+                                  % (name, days_left, date_str))
                 state[ekey] = True
                 break
 
@@ -666,26 +1235,40 @@ def cmd_watchdog(cfg, summary_mode):
 
     summary = build_summary(cfg, results, state, today)
     log(cfg, "summary: " + summary.replace("\n", " | "))
+    time_only = dashboard_mode(cfg) == "time" or not results
     if alerts:
-        push(cfg, "额度提醒", "\n".join(alerts) + "\n——\n" + summary)
+        push(cfg, "套餐提醒" if time_only else "额度提醒",
+             "\n".join(alerts) + "\n——\n" + summary)
     elif summary_mode:
-        push(cfg, "每日额度报告", summary)
+        push(cfg, "每日套餐报告" if time_only else "每日额度报告", summary)
 
 
 def build_summary(cfg, results, state, today):
     lines = []
+    seen = set()
     for acct, q in results.items():
         if "error" in q:
             lines.append(acct + ": 查询失败")
+        else:
+            parts = []
+            for win, (pct, reset) in q.items():
+                label = "5h" if win == "5h" else "周"
+                parts.append("%s %s%s%s" % (label, fmt_pct(pct), fmt_reset_short(cfg, reset), pace_note(pct, reset, win)))
+            lines.append("%s: %s" % (acct, " · ".join(parts)))
+        seen.add(acct)
+    for acct in account_list(cfg):
+        if not is_time_account(cfg, acct):
             continue
-        parts = []
-        for win, (pct, reset) in q.items():
-            label = "5h" if win == "5h" else "周"
-            parts.append("%s %s%s%s" % (label, fmt_pct(pct), fmt_reset_short(cfg, reset), pace_note(pct, reset, win)))
-        lines.append("%s: %s" % (acct, " · ".join(parts)))
+        label = acct["label"]
+        if label in seen:
+            continue
+        lines.append(fmt_time_summary_line(cfg, acct))
+        seen.add(label)
     now = now_utc()
     for name, date_str in (cfg.get("plan_expiry") or {}).items():
-        exp = parse_ts(str(date_str) + "T00:00:00+%02d:00" % cfg["timezone_offset_hours"])
+        if name in seen:
+            continue
+        exp = parse_local_date(cfg, date_str)
         if exp:
             days_left = (exp.date() - now.astimezone(cfg["_tz"]).date()).days
             lines.append("%s 套餐: %d 天后到期（%s）" % (name, max(days_left, 0), date_str))
@@ -764,11 +1347,14 @@ def reset_left(ts):
     return "%d天后" % round(hours / 24)
 
 
-def fmt_reset_page(cfg, ts):
+def fmt_reset_page(cfg, ts, kind="reset"):
     if ts is None:
-        return "重置时间未知"
+        return "到期时间未知" if kind == "expiry" else "重置时间未知"
     bj = ts.astimezone(cfg["_tz"])
-    return "%d月%d日 %02d:%02d 重置（%s）" % (bj.month, bj.day, bj.hour, bj.minute, reset_left(ts))
+    left = reset_left(ts)
+    if kind == "expiry":
+        return "%d月%d日 到期（%s）" % (bj.month, bj.day, left)
+    return "%d月%d日 %02d:%02d 重置（%s）" % (bj.month, bj.day, bj.hour, bj.minute, left)
 
 
 
@@ -830,15 +1416,25 @@ def quota_capacity_info(acct, window=None):
 
 
 def window_html(cfg, label, pct, reset, note="", elapsed=None,
-                capacity_tier=0, quota_label=""):
+                capacity_tier=0, quota_label="", end_kind="reset",
+                fill_cls=None, show_ticks=False):
     """One quota bar. Its data attributes drive summary and client-side sorts.
     The title keeps reset time and pace reachable in the mini density, which
     hides both to stay one row tall."""
     pct_txt = "未知" if pct is None else ("%.2f%%" % pct if pct < 10 else "%.1f%%" % pct)
-    fill_width = "0" if pct is None or pct <= 0 else "max(3px, %.1f%%)" % min(pct, 100)
-    marker_html = ""
+    if show_ticks:
+        fill_width = "0" if pct is None or pct <= 0 else "%.2f%%" % min(pct, 100)
+    else:
+        fill_width = "0" if pct is None or pct <= 0 else "max(3px, %.1f%%)" % min(pct, 100)
+    ticks_html = ""
+    if show_ticks:
+        ticks_html = ('<div class="time-ticks" aria-hidden="true">'
+                      + "".join('<i style="left:%d%%"></i>' % p for p in (0, 25, 50, 75, 100))
+                      + "</div>")
+    marker_html = ticks_html
     if elapsed is not None:
-        marker_html = '<div class="time-marker" style="left:%.1f%%"></div>' % max(min(elapsed, 100), 0)
+        marker_html += ('<div class="time-marker" style="left:%.1f%%" title="现在"></div>'
+                        % max(min(elapsed, 100), 0))
     # colour the pace verdict word only, not the whole meta line — fast burns
     # amber, slow burns a muted blue, on-track stays dim grey
     note_cls = ""
@@ -848,9 +1444,9 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None,
         elif "偏慢" in note:
             note_cls = " pace-slow"
     note_html = '<span class="note%s">%s</span>' % (note_cls, html.escape(note)) if note else ""
-    reset_txt = fmt_reset_page(cfg, reset)
+    reset_txt = fmt_reset_page(cfg, reset, kind=end_kind)
     reset_iso = reset.astimezone(datetime.timezone.utc).isoformat() if reset else ""
-    fc = fill_class(pct)
+    fc = fill_class(pct) if fill_cls is None else fill_cls
     fill_cls = ("fill " + fc).strip()
     # the percentage picks up the same state colour as its bar, so a near-ceiling
     # window reads amber at a glance from the number alone
@@ -987,20 +1583,28 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   /* Default view: a horizontal usage chart. Account labels occupy one fixed
      column and every quota lane starts at the same x coordinate. Track length
      always means 0–100% usage; plan capacity has a separate tier marker. */
-  #chart-guide { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; align-items: end; padding: 0 20px 8px; }
+  #chart-guide { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 24px; align-items: end; padding: 0 20px 8px; }
   .guide-title { color: var(--ink-3); font-size: 10px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; }
   .axis-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; }
   .usage-axis { height: 28px; border-bottom: 1px solid var(--card-border); display: flex; align-items: flex-end; justify-content: space-between; padding-bottom: 7px; color: var(--ink-3); font-family: var(--mono); font-size: 9.5px; }
 
   #cards { display: flex; flex-direction: column; gap: 0; align-items: stretch; }
-  .card { display: grid; grid-template-columns: 220px minmax(0, 1fr); column-gap: 24px; row-gap: 6px; padding: 18px 20px; border: 0; border-bottom: 1px solid var(--card-border); border-radius: 0; background: transparent; box-shadow: none; position: relative; }
+  .card { display: grid; grid-template-columns: 260px minmax(0, 1fr); column-gap: 24px; row-gap: 6px; padding: 18px 20px; border: 0; border-bottom: 1px solid var(--card-border); border-radius: 0; background: transparent; box-shadow: none; position: relative; }
   .card.alert { border-color: var(--card-alert-border); background: transparent; }
   .card.hidden { display: none; }
-  .card h2 { grid-column: 1; grid-row: 1; font-size: 14.5px; margin: 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; font-weight: 600; letter-spacing: -.01em; }
-  .title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .title > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .plan { color: var(--ink-3); font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
-  .card-actions { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 400; white-space: nowrap; flex-shrink: 0; }
+  .card h2 { grid-column: 1; grid-row: 1; font-size: 14.5px; margin: 0; display: flex; flex-wrap: wrap; justify-content: flex-start; align-items: flex-start; gap: 8px; font-weight: 600; letter-spacing: -.01em; }
+  .title { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 100%; }
+  .title > span:first-child { overflow: visible; text-overflow: unset; white-space: normal; overflow-wrap: anywhere; }
+  .plan { color: var(--ink-3); font-size: 11px; font-weight: 400; overflow: visible; text-overflow: unset; white-space: normal; font-family: var(--mono); }
+  .card-actions { display: flex; align-items: center; gap: 8px; font-size: 11px; font-weight: 400; white-space: nowrap; flex: 1 1 100%; flex-wrap: wrap; }
+  .card[data-track="time"] .time-edit-btn { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+  .card[data-track="time"] .win, .card[data-track="time"] .reset { cursor: pointer; }
+  .card[data-track="time"] .reset { text-decoration: underline dotted; text-underline-offset: 3px; }
+  .used-up-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-2); cursor: pointer; font-weight: 500; user-select: none; }
+  .used-up-toggle input { width: 15px; height: 15px; accent-color: var(--accent); }
+  .card.used-up { opacity: .55; }
+  .card.used-up .title > span:first-child { text-decoration: line-through; }
+  .card.used-up .used-up-toggle { color: var(--accent); }
   .drag-handle { color: var(--ink-3); cursor: grab; font-size: 10px; font-weight: 500; padding: 7px 3px; touch-action: none; user-select: none; }
   .drag-handle:active { cursor: grabbing; }
   .drag-handle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
@@ -1026,6 +1630,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .fill.high { background: var(--warn); }
   .fill.crit { background: var(--bad); }
   .time-marker { position: absolute; z-index: 2; top: -4px; bottom: -4px; width: 2px; background: var(--bar-marker); box-shadow: 0 0 0 1px var(--bg); opacity: .8; border-radius: 2px; }
+  .time-ticks { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
+  .time-ticks i { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--bar-marker); opacity: .32; }
+  .time-ticks i:first-child, .time-ticks i:last-child { opacity: .55; }
+  .card[data-track="time"] .time-marker { background: var(--ink); opacity: 1; }
   .meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
   .reset { color: var(--ink-3); font-size: 10.5px; font-family: var(--mono); }
   .note { color: var(--ink-3); font-size: 10.5px; }
@@ -1086,6 +1694,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   body.hide-sub .plan { display: none; }
   body.hide-reset .reset { display: none; }
   body.hide-pace .note, body.hide-pace .time-marker { display: none; }
+  body.hide-pace .card[data-track="time"] .time-marker,
+  body.hide-pace .card[data-track="time"] .time-ticks { display: block; }
   body.hide-capacity .capacity { display: none; }
   body.hide-fetched .fetched { display: none; }
   body.hide-expiry .expiry { display: none; }
@@ -1111,7 +1721,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .set-sec { color: var(--ink-3); font-size: 11px; margin: 18px 0 8px; border-top: 1px solid var(--card-border); padding-top: 14px; letter-spacing: .04em; text-transform: uppercase; font-weight: 500; }
   .set-sec:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
   .set-acct { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 4px 0; }
-  .set-acct label { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+  .set-acct label { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: visible; white-space: normal; overflow-wrap: anywhere; color: var(--ink); }
   .set-acct button { padding: 1px 9px; }
   .set-acct button[disabled] { opacity: .35; cursor: default; }
   #set-show label { display: flex; align-items: center; gap: 8px; padding: 4px 0; color: var(--ink); }
@@ -1119,6 +1729,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .set-btns { display: flex; gap: 8px; margin-top: 8px; }
   .set-hint { color: var(--ink-3); font-size: 10.5px; margin-top: 12px; line-height: 1.5; }
   .mini-btn.flash { color: var(--good); border-color: var(--good); }
+  .set-field { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; color: var(--ink-2); }
+  .set-field input, .set-field select { min-width: 0; flex: 1; max-width: 240px; }
+  .set-field input[type="number"] { max-width: 120px; }
+  .set-field input:disabled { opacity: .55; }
+  #time-days-row[hidden], #time-delete[hidden] { display: none; }
 </style>
 </head>
 <body class="d-comfy">
@@ -1130,17 +1745,18 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="controls">
   <a class="btn primary refresh-link" href="/refresh">刷新全部</a>
   <button class="btn" id="share-toggle" title="隐藏邮箱、时间戳等可识别信息，方便截图分享">隐私模式</button>
+  <button class="btn" id="add-time" title="添加一张套餐，或给已有套餐改开始/到期日">添加 / 改日期</button>
   <button class="btn" id="open-settings"><svg class="gear" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.3 3.3l1.4 1.4M11.3 11.3l1.4 1.4M3.3 12.7l1.4-1.4M11.3 4.7l1.4-1.4"/></svg>显示设置</button>
 </div>
 <div id="chart-guide">
   <span class="guide-title">套餐 / 周期从长到短</span>
   <div class="axis-grid" aria-label="每条轨道均表示从零到百分之百的使用比例">
-    <div class="usage-axis"><span>使用比例</span><span>100%</span></div>
-    <div class="usage-axis" aria-hidden="true"><span>使用比例</span><span>100%</span></div>
-    <div class="usage-axis" aria-hidden="true"><span>使用比例</span><span>100%</span></div>
+    <div class="usage-axis"><span>@AXIS_LABEL@</span><span>100%</span></div>
+    <div class="usage-axis" aria-hidden="true"><span>@AXIS_LABEL@</span><span>100%</span></div>
+    <div class="usage-axis" aria-hidden="true"><span>@AXIS_LABEL@</span><span>100%</span></div>
   </div>
 </div>
-<div id="cards">@CARDS@</div>
+<div id="cards" data-mode="@MODE@" data-tz="@TZ@">@CARDS@</div>
 
 <div class="modal" id="settings" hidden>
   <div class="modal-box">
@@ -1162,6 +1778,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     </select></div>
     <div class="set-sec">显示哪些账号 · 调整顺序</div>
     <div id="set-accounts"></div>
+    <div class="set-sec">计时日期（开始 / 到期）</div>
+    <div id="set-times"></div>
     <div class="set-sec">显示哪些内容</div>
     <div id="set-show"></div>
     <div class="set-sec">备份与重置</div>
@@ -1179,6 +1797,31 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="modal" id="time-edit" hidden>
+  <div class="modal-box">
+    <div class="modal-head"><b id="time-edit-title">设置时间</b><button class="mini-btn" id="time-edit-close">关闭</button></div>
+    <div class="set-field"><span>名称</span><input id="time-label" type="text" maxlength="40" placeholder="例如 Claude Pro"></div>
+    <div class="set-field"><span>副标题</span><input id="time-sub" type="text" maxlength="60" placeholder="可选"></div>
+    <div class="set-field"><span>开始</span><input id="time-started" type="datetime-local"></div>
+    <div class="set-field"><span>到期 / 重置</span><input id="time-expires" type="datetime-local"></div>
+    <div class="set-field"><span>周期</span><select id="time-period">
+      <option value="">不滚动（用上面的起止日）</option>
+      <option value="monthly">每月（按开始日滚动）</option>
+      <option value="yearly">每年</option>
+      <option value="days">自定义天数</option>
+    </select></div>
+    <div class="set-field" id="time-days-row" hidden><span>每期天数</span><input id="time-days" type="number" min="1" max="3660" placeholder="30"></div>
+    <div class="set-hint">点保存会写入服务器上的 config.json（只改开始/到期日，不动 API key）。没有 <code>serve</code> 接口时会退回只存在这个浏览器。</div>
+    <div class="set-hint" id="time-save-status"></div>
+    <div class="set-btns">
+      <button class="mini-btn" id="time-save">保存到服务器</button>
+      <button class="mini-btn" id="time-copy">复制配置片段</button>
+      <button class="mini-btn" id="time-reset">恢复默认</button>
+      <button class="mini-btn" id="time-delete" hidden>删除这张卡</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function(){
   var KEY = 'quotaSettings';
@@ -1187,9 +1830,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
               ['pace','节奏提示与时间刻度'], ['fetched','更新时间'], ['expiry','套餐到期'],
               ['summary','顶部摘要']];
   function defaults(){
-    return {v: 5, theme: 'auto', density: 'comfy', sort: 'expiry', order: [], orderCustomized: false, hidden: [],
+    return {v: 6, theme: 'auto', density: 'comfy', sort: 'expiry', order: [], orderCustomized: false, hidden: [],
             show: {badge: true, sub: true, reset: true, capacity: true, pace: true, fetched: true, expiry: true, summary: true},
-            autoRefresh: 0};
+            autoRefresh: 0, times: {}, extraTimes: [], usedUp: {}};
   }
   var S = defaults(), timer = null;
 
@@ -1211,6 +1854,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       S.orderCustomized = !!raw.orderCustomized;
     }
     if (Array.isArray(raw.hidden)) S.hidden = raw.hidden.slice();
+    if (raw.times && typeof raw.times === 'object') S.times = raw.times;
+    if (Array.isArray(raw.extraTimes)) S.extraTimes = raw.extraTimes.slice();
+    if (raw.usedUp && typeof raw.usedUp === 'object') S.usedUp = raw.usedUp;
     if (raw.show) SHOW.forEach(function(p){
       if (raw.show[p[0]] !== undefined) S.show[p[0]] = !!raw.show[p[0]];
     });
@@ -1245,6 +1891,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
 
   function expiryRank(card){
+    if (isUsedUp(card)) return {tier: 2, resetAt: Infinity, remaining: 0};
     // Cards render quota windows longest-first. Sort by that primary window;
     // a frequently-resetting 5h allowance must not outrank a monthly/weekly one.
     var w = card.querySelector('.win');
@@ -1293,7 +1940,217 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     S.hidden = S.hidden.filter(function(n){ return names.indexOf(n) >= 0; });
   }
 
+  function tzHours(){
+    var n = parseInt((document.getElementById('cards') || {}).getAttribute && document.getElementById('cards').getAttribute('data-tz'), 10);
+    return isNaN(n) ? 8 : n;
+  }
+  function parseLocal(s){
+    if (!s) return null;
+    var m = String(s).trim().match(/^(\\d{4})-(\\d{2})-(\\d{2})(?:[T ](\\d{2}):(\\d{2})(?::(\\d{2}))?)?/);
+    if (!m) return null;
+    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0) - tzHours(), +(m[5] || 0), +(m[6] || 0)));
+  }
+  function ymd(dt){
+    var t = new Date(dt.getTime() + tzHours() * 3600000);
+    return t.getUTCFullYear() + '-' + String(t.getUTCMonth() + 1).padStart(2, '0') + '-' + String(t.getUTCDate()).padStart(2, '0');
+  }
+  function addMonths(dt, n, refDay){
+    var t = new Date(dt.getTime() + tzHours() * 3600000);
+    var y = t.getUTCFullYear(), m = t.getUTCMonth() + n;
+    y += Math.floor(m / 12); m = ((m % 12) + 12) % 12;
+    var last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+    var day = Math.min(refDay, last);
+    return new Date(Date.UTC(y, m, day, t.getUTCHours(), t.getUTCMinutes(), t.getUTCSeconds()) - tzHours() * 3600000);
+  }
+  function cycleBounds(started, now, period){
+    if (!started || !period) return null;
+    if (period === 'monthly' || period === 'yearly') {
+      var step = period === 'yearly' ? 12 : 1, ref = (function(){
+        var t = new Date(started.getTime() + tzHours() * 3600000);
+        return t.getUTCDate();
+      })();
+      for (var n = 0; n < 240; n++) {
+        var a = addMonths(started, n * step, ref), b = addMonths(started, (n + 1) * step, ref);
+        if (now < b) return [a, b];
+      }
+      return null;
+    }
+    var days = parseInt(period, 10);
+    if (!days || days <= 0) return null;
+    var start = started, delta = days * 86400000;
+    for (var i = 0; i < 4000; i++) {
+      var end = new Date(start.getTime() + delta);
+      if (now < end) return [start, end];
+      start = end;
+    }
+    return null;
+  }
+  function timeWindow(startedAt, expiresAt, period){
+    var now = new Date();
+    var started = parseLocal(startedAt), expires = parseLocal(expiresAt);
+    var start = started, end = expires;
+    if (started && period) {
+      var bounds = cycleBounds(started, now, period);
+      if (bounds) {
+        start = bounds[0]; end = bounds[1];
+        if (expires && end > expires) end = expires;
+        if (expires && start >= expires) { start = started; end = expires; }
+      }
+    }
+    if (!start && end) {
+      if (period === 'monthly') start = addMonths(end, -1, (function(){ var t = new Date(end.getTime() + tzHours() * 3600000); return t.getUTCDate(); })());
+      else if (period === 'yearly') start = addMonths(end, -12, (function(){ var t = new Date(end.getTime() + tzHours() * 3600000); return t.getUTCDate(); })());
+      else {
+        var pd = parseInt(period, 10);
+        start = new Date(end.getTime() - ((pd > 0) ? pd : 7) * 86400000);
+      }
+    }
+    if (!start && !end) return null;
+    var expired = !!(end && now >= end);
+    var total = (start && end) ? (end - start) / 1000 : 0;
+    var elapsedPct = null, remainingDays = null, overdueDays = 0, elapsedDays = 0;
+    if (total > 0) {
+      var elapsedSec = ((expired ? end : now) - start) / 1000;
+      elapsedPct = expired ? 100 : Math.min(Math.max(elapsedSec / total * 100, 0), 100);
+      elapsedDays = Math.max(0, elapsedSec / 86400);
+      remainingDays = expired ? 0 : Math.max(0, (end - now) / 86400000);
+    } else if (expired) {
+      elapsedPct = 100;
+    } else if (start) {
+      elapsedPct = 0;
+      elapsedDays = Math.max(0, (now - start) / 86400000);
+    }
+    if (expired && end) overdueDays = Math.max(0, (now - end) / 86400000);
+    return {start: start, end: end, elapsedPct: elapsedPct, elapsedDays: elapsedDays,
+            remainingDays: remainingDays, overdueDays: overdueDays, expired: expired};
+  }
+  function fmtSpanDays(days){
+    if (days === null || days === undefined) return '?';
+    if (days < 0) days = 0;
+    var hours = days * 24;
+    if (hours < 1) return Math.max(1, Math.round(hours * 60)) + ' 分钟';
+    if (days < 1) return hours.toFixed(1) + ' 小时';
+    if (days >= 10 && Math.abs(days - Math.round(days)) < 0.05) return Math.round(days) + ' 天';
+    return days.toFixed(1) + ' 天';
+  }
+  function timeWinLabel(period){
+    if (period === 'monthly') return '本月周期';
+    if (period === 'yearly') return '本年周期';
+    var d = parseInt(period, 10);
+    return d ? (d + '天周期') : '套餐周期';
+  }
+  function resetLeftTxt(end){
+    if (!end) return '';
+    var hours = (end - Date.now()) / 3600000;
+    if (hours < 0) return '即将到期';
+    if (hours < 1) return Math.round(hours * 60) + '分钟后';
+    if (hours < 24) return Math.round(hours) + '小时后';
+    return Math.round(hours / 24) + '天后';
+  }
+  function fmtExpiry(end){
+    if (!end) return '到期时间未知';
+    var t = new Date(end.getTime() + tzHours() * 3600000);
+    return (t.getUTCMonth() + 1) + '月' + t.getUTCDate() + '日 到期（' + resetLeftTxt(end) + '）';
+  }
+  function fillCls(tw){
+    if (!tw) return '';
+    if (tw.expired || (tw.remainingDays !== null && tw.remainingDays <= 1)) return 'crit';
+    if (tw.remainingDays !== null && tw.remainingDays <= 7) return 'high';
+    return '';
+  }
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, function(c){
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+    });
+  }
+  function winHtml(tw, period){
+    var fc = fillCls(tw);
+    var pct = tw && tw.elapsedPct;
+    var pctTxt = (pct === null || pct === undefined) ? '未知' : (pct < 10 ? pct.toFixed(2) : pct.toFixed(1)) + '%';
+    var width = (pct === null || pct === undefined || pct <= 0) ? '0' : (Math.min(pct, 100).toFixed(2) + '%');
+    var note = '';
+    if (tw && tw.expired) note = tw.overdueDays ? ('已过期 ' + fmtSpanDays(tw.overdueDays)) : '已到期';
+    else if (tw && tw.remainingDays !== null) note = '已过 ' + fmtSpanDays(tw.elapsedDays) + ' · 还剩 ' + fmtSpanDays(tw.remainingDays);
+    else if (tw) note = '已过 ' + fmtSpanDays(tw.elapsedDays);
+    var resetTxt = fmtExpiry(tw && tw.end);
+    var short = timeWinLabel(period);
+    var resetIso = (tw && tw.end) ? tw.end.toISOString() : '';
+    var left = resetLeftTxt(tw && tw.end);
+    var ticks = '<div class="time-ticks" aria-hidden="true"><i style="left:0%"></i><i style="left:25%"></i><i style="left:50%"></i><i style="left:75%"></i><i style="left:100%"></i></div>';
+    var marker = (pct === null || pct === undefined) ? '' : ('<div class="time-marker" style="left:' + Math.max(Math.min(pct, 100), 0).toFixed(1) + '%" title="现在"></div>');
+    return '<div class="win" data-pct="' + (pct === null || pct === undefined ? '' : pct.toFixed(1)) + '" data-short="' + escapeHtml(short) + '" data-reset-short="' + escapeHtml(left) + '" data-reset-at="' + escapeHtml(resetIso) + '" data-capacity="" title="' + escapeHtml(short + ' / ' + resetTxt + (note ? ' / ' + note : '')) + '">' +
+      '<div class="win-head"><span>' + escapeHtml(short) + '</span><span class="pct ' + fc + '">' + pctTxt + '</span></div>' +
+      '<div class="win-scale"><div class="bar"><div class="fill ' + fc + '" style="width:' + width + '"></div>' + ticks + marker + '</div></div>' +
+      '<div class="meta"><span class="reset">' + escapeHtml(resetTxt) + '</span>' + (note ? '<span class="note">' + escapeHtml(note) + '</span>' : '') + '</div></div>';
+  }
+  function resolvedTime(card){
+    var name = acctOf(card);
+    var ov = (S.times || {})[name] || {};
+    return {
+      started: ov.started_at !== undefined ? ov.started_at : (card.getAttribute('data-started') || ''),
+      expires: ov.expires_at !== undefined ? ov.expires_at : (card.getAttribute('data-expires') || ''),
+      period: ov.period !== undefined ? ov.period : (card.getAttribute('data-period') || ''),
+      sub: ov.sub !== undefined ? ov.sub : ''
+    };
+  }
+  function isUsedUp(card){
+    var name = acctOf(card);
+    if (S.usedUp && Object.prototype.hasOwnProperty.call(S.usedUp, name)) return !!S.usedUp[name];
+    return card.getAttribute('data-used-up') === '1';
+  }
+  function markUsedUp(card, on){
+    if (!card) return;
+    card.setAttribute('data-used-up', on ? '1' : '0');
+    card.classList.toggle('used-up', on);
+    var box = card.querySelector('.used-up-box');
+    if (box) box.checked = !!on;
+    if (on) card.classList.remove('alert');
+  }
+  function paintTimeCard(card){
+    var spec = resolvedTime(card);
+    var tw = timeWindow(spec.started, spec.expires, spec.period);
+    var box = card.querySelector('.wins');
+    if (!box) return;
+    if (!tw) box.innerHTML = '<div class="err">未配置 started_at / expires_at，无法计时</div>';
+    else box.innerHTML = winHtml(tw, spec.period);
+    var used = isUsedUp(card);
+    markUsedUp(card, used);
+    card.classList.toggle('alert', !used && !!(tw && (tw.expired || (tw.remainingDays !== null && tw.remainingDays <= 7))));
+    if (spec.sub) {
+      var plan = card.querySelector('.plan');
+      if (plan) plan.textContent = spec.sub;
+    }
+  }
+  function extraCardHtml(item){
+    var label = item.label || '未命名';
+    var used = !!(item.used_up);
+    return '<div class="card' + (used ? ' used-up' : '') + '" data-account="' + escapeHtml(label) + '" data-provider="time" data-health="ok" data-track="time" data-extra="1" data-started="' + escapeHtml(item.started_at || '') + '" data-expires="' + escapeHtml(item.expires_at || '') + '" data-period="' + escapeHtml(item.period || '') + '" data-used-up="' + (used ? '1' : '0') + '">' +
+      '<h2><span class="title"><span>' + escapeHtml(label) + '</span>' + (item.sub ? '<span class="plan">' + escapeHtml(item.sub) + '</span>' : '') + '</span>' +
+      '<span class="card-actions"><span class="badge b-ok"><i class="dot"></i></span>' +
+      '<span class="drag-handle" role="button" tabindex="0" title="拖动账号调整顺序" aria-label="拖动账号调整顺序">拖动</span>' +
+      '<label class="used-up-toggle"><input type="checkbox" class="used-up-box" data-account="' + escapeHtml(label) + '"' + (used ? ' checked' : '') + '> 用完了</label>' +
+      '<button class="mini-btn time-edit-btn" type="button" data-account="' + escapeHtml(label) + '">改日期</button></span></h2>' +
+      '<div class="wins"></div><div class="fetched">本地计时 · 仅此浏览器</div></div>';
+  }
+  function injectExtraTimes(){
+    var host = document.getElementById('cards');
+    if (!host) return;
+    [].forEach.call(host.querySelectorAll('.card[data-extra="1"]'), function(c){ c.parentNode.removeChild(c); });
+    (S.extraTimes || []).forEach(function(item){
+      if (!item || !item.label) return;
+      if (host.querySelector('[data-account="' + CSS.escape(item.label) + '"]')) return;
+      host.insertAdjacentHTML('beforeend', extraCardHtml(item));
+    });
+  }
+  function applyTimes(){
+    injectExtraTimes();
+    cards().forEach(function(c){
+      if (c.getAttribute('data-track') === 'time') paintTimeCard(c);
+    });
+  }
+
   function apply(){
+    applyTimes();
     syncOrder();
     var b = document.body;
     // density + theme + detail toggles are all body classes; toggle each by
@@ -1305,7 +2162,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     else if (S.theme === 'light') b.classList.add('theme-light');
     SHOW.forEach(function(p){ b.classList.toggle('hide-' + p[0], !S.show[p[0]]); });
     var ordered = cards().slice();
-    if (S.sort === 'expiry') ordered = groupedOrder(compareExpiry);
+    var mode = (document.getElementById('cards') && document.getElementById('cards').getAttribute('data-mode')) || '';
+    if (S.sort === 'expiry') ordered = (mode === 'time') ? ordered.sort(compareExpiry) : groupedOrder(compareExpiry);
     else if (S.sort === 'waste') ordered = autoOrder(wasteScore);
     else if (S.sort === 'usage') ordered = autoOrder(maxPct);
     else ordered.sort(function(a, b){ return S.order.indexOf(acctOf(a)) - S.order.indexOf(acctOf(b)); });
@@ -1327,12 +2185,20 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var vis = cards().filter(function(c){ return !c.classList.contains('hidden'); });
     if (!vis.length) { el.textContent = '没有显示中的账号，点右上角“显示设置”打开几个'; el.className = 'summary'; return; }
     var ok = 0, unknown = 0, bad = [], worst = null;
+    var mode = (document.getElementById('cards') && document.getElementById('cards').getAttribute('data-mode')) || '';
     vis.forEach(function(c){
       var h = c.getAttribute('data-health') || '';
       if (h === 'ok') ok++;
       else if (h === 'unknown') unknown++;
       else if (h) bad.push(acctOf(c));
       [].forEach.call(c.querySelectorAll('.win'), function(w){
+        if (mode === 'time') {
+          var resetAt = Date.parse(w.getAttribute('data-reset-at') || '');
+          if (isNaN(resetAt)) return;
+          if (!worst || resetAt < worst.resetAt) worst = {acct: acctOf(c),
+            reset: w.getAttribute('data-reset-short') || '', resetAt: resetAt};
+          return;
+        }
         var p = parseFloat(w.getAttribute('data-pct'));
         if (isNaN(p)) return;
         if (!worst || p > worst.pct) worst = {pct: p, acct: acctOf(c),
@@ -1342,12 +2208,18 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var head;
     if (bad.length) head = bad.length + ' 个异常：' + bad.join('、');
     else if (ok) head = ok + '/' + vis.length + ' 正常';
+    else if (mode === 'time') head = vis.length + ' 个套餐计时中';
     else head = '健康检查暂不可用';
-    if (worst) head += '，额度最高 ' + worst.acct + ' ' + worst.win + ' ' + Math.round(worst.pct) + '%'
-                     + (worst.reset ? '，' + worst.reset + '重置' : '');
+    if (worst && mode === 'time') {
+      head += '，最近到期 ' + worst.acct + (worst.reset ? ' ' + worst.reset : '');
+    } else if (worst) {
+      head += '，额度最高 ' + worst.acct + ' ' + worst.win + ' ' + Math.round(worst.pct) + '%'
+           + (worst.reset ? '，' + worst.reset + '重置' : '');
+    }
     el.textContent = head;
     // an account sitting near its ceiling is worth noticing even with every token healthy
-    el.className = 'summary' + (bad.length ? ' bad' : (worst && worst.pct >= 85 ? ' warn' : ''));
+    var soon = worst && mode === 'time' && (worst.resetAt - Date.now()) <= 7 * 864e5;
+    el.className = 'summary' + (bad.length ? ' bad' : (soon || (worst && worst.pct >= 85) ? ' warn' : ''));
   }
 
   function buildPanel(){
@@ -1392,6 +2264,32 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       row.appendChild(btns);
       box.appendChild(row);
     });
+
+    var timeBox = document.getElementById('set-times');
+    if (timeBox) {
+      timeBox.innerHTML = '';
+      var timeCards = cards().filter(function(c){ return c.getAttribute('data-track') === 'time'; });
+      if (!timeCards.length) {
+        var empty = document.createElement('div');
+        empty.className = 'set-hint';
+        empty.textContent = '还没有计时卡。点顶栏「添加 / 改日期」。';
+        timeBox.appendChild(empty);
+      }
+      timeCards.forEach(function(c){
+        var spec = resolvedTime(c);
+        var row = document.createElement('div');
+        row.className = 'set-acct';
+        var lab = document.createElement('label');
+        lab.textContent = acctOf(c) + '  ·  ' + (spec.started || '—') + ' → ' + (spec.expires || '未设到期');
+        row.appendChild(lab);
+        var b = document.createElement('button');
+        b.className = 'mini-btn';
+        b.textContent = '改日期';
+        b.onclick = function(){ modal.hidden = true; openTimeEdit(acctOf(c), false); };
+        row.appendChild(b);
+        timeBox.appendChild(row);
+      });
+    }
 
     var showBox = document.getElementById('set-show');
     showBox.innerHTML = '';
@@ -1461,7 +2359,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   document.getElementById('open-settings').onclick = function(){ buildPanel(); modal.hidden = false; };
   document.getElementById('set-close').onclick = function(){ modal.hidden = true; };
   modal.onclick = function(e){ if (e.target === modal) modal.hidden = true; };
-  document.addEventListener('keydown', function(e){ if (e.key === 'Escape') modal.hidden = true; });
+  document.addEventListener('keydown', function(e){
+    if (e.key !== 'Escape') return;
+    modal.hidden = true;
+    timeModal.hidden = true;
+  });
 
   function bindSelect(id, key, asInt){
     document.getElementById(id).onchange = function(){
@@ -1549,6 +2451,206 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   });
 
   // ---- privacy / share mode: session-only, not persisted ----
+  var timeModal = document.getElementById('time-edit');
+  var timeEditing = null; // account label, or '' when adding
+  function toLocalValue(s){
+    if (!s) return '';
+    var dt = parseLocal(s);
+    if (!dt) return String(s).slice(0, 16);
+    var t = new Date(dt.getTime() + tzHours() * 3600000);
+    function p(n){ return String(n).padStart(2, '0'); }
+    return t.getUTCFullYear() + '-' + p(t.getUTCMonth() + 1) + '-' + p(t.getUTCDate()) + 'T' + p(t.getUTCHours()) + ':' + p(t.getUTCMinutes());
+  }
+  function fromLocalValue(s){
+    if (!s) return '';
+    if (/T00:00$/.test(s)) return s.slice(0, 10);
+    return s;
+  }
+  function currentPeriodValue(){
+    var p = document.getElementById('time-period').value;
+    if (p === 'days') {
+      var n = parseInt(document.getElementById('time-days').value, 10);
+      return n > 0 ? String(n) : '';
+    }
+    return p;
+  }
+  function syncPeriodRow(){
+    document.getElementById('time-days-row').hidden = document.getElementById('time-period').value !== 'days';
+  }
+  function openTimeEdit(name, isNew){
+    timeEditing = isNew ? '' : name;
+    var card = name ? document.querySelector('#cards [data-account="' + CSS.escape(name) + '"]') : null;
+    var extra = (S.extraTimes || []).filter(function(x){ return x && x.label === name; })[0];
+    var spec = card ? resolvedTime(card) : {started: '', expires: '', period: '', sub: ''};
+    if (extra) {
+      spec.started = extra.started_at || spec.started;
+      spec.expires = extra.expires_at || spec.expires;
+      spec.period = extra.period || spec.period;
+      spec.sub = extra.sub || spec.sub;
+    }
+    document.getElementById('time-edit-title').textContent = isNew ? '添加计时' : ('设置时间 · ' + name);
+    var labelEl = document.getElementById('time-label');
+    labelEl.value = isNew ? '' : name;
+    labelEl.disabled = !isNew && !(card && card.getAttribute('data-extra') === '1');
+    document.getElementById('time-sub').value = spec.sub || (card && card.querySelector('.plan') ? card.querySelector('.plan').textContent : '');
+    document.getElementById('time-started').value = toLocalValue(spec.started);
+    document.getElementById('time-expires').value = toLocalValue(spec.expires);
+    var per = spec.period || '';
+    if (per && per !== 'monthly' && per !== 'yearly') {
+      document.getElementById('time-period').value = 'days';
+      document.getElementById('time-days').value = per;
+    } else {
+      document.getElementById('time-period').value = per;
+      document.getElementById('time-days').value = '';
+    }
+    syncPeriodRow();
+    document.getElementById('time-delete').hidden = !(card && card.getAttribute('data-extra') === '1') && !extra;
+    setTimeStatus('');
+    timeModal.hidden = false;
+    if (isNew) labelEl.focus();
+  }
+  document.getElementById('time-period').onchange = syncPeriodRow;
+  document.getElementById('time-edit-close').onclick = function(){ timeModal.hidden = true; };
+  timeModal.onclick = function(e){ if (e.target === timeModal) timeModal.hidden = true; };
+  document.getElementById('add-time').onclick = function(){ openTimeEdit('', true); };
+  document.addEventListener('click', function(e){
+    var btn = e.target.closest && e.target.closest('.time-edit-btn');
+    if (btn) {
+      e.preventDefault();
+      openTimeEdit(btn.getAttribute('data-account') || '', false);
+      return;
+    }
+    var win = e.target.closest && e.target.closest('.card[data-track="time"] .win, .card[data-track="time"] .reset');
+    if (!win) return;
+    var card = win.closest('.card');
+    if (!card) return;
+    e.preventDefault();
+    openTimeEdit(acctOf(card), false);
+  });
+  document.addEventListener('change', function(e){
+    var box = e.target && e.target.classList && e.target.classList.contains('used-up-box') ? e.target : null;
+    if (!box) return;
+    var label = box.getAttribute('data-account') || '';
+    var on = !!box.checked;
+    var card = box.closest('.card');
+    markUsedUp(card, on);
+    apply();
+    postDates({label: label, used_up: on}).then(function(){
+      if (S.usedUp) delete S.usedUp[label];
+      save();
+    }).catch(function(){
+      S.usedUp = S.usedUp || {};
+      S.usedUp[label] = on;
+      save();
+    });
+  });
+  function setTimeStatus(text){
+    var el = document.getElementById('time-save-status');
+    if (el) el.textContent = text || '';
+  }
+  function rememberLocal(label, rec, isExtra){
+    if (isExtra) {
+      S.extraTimes = (S.extraTimes || []).filter(function(x){ return x && x.label !== label; });
+      S.extraTimes.push({label: label, sub: rec.sub, started_at: rec.started_at, expires_at: rec.expires_at, period: rec.period});
+      if (S.times) delete S.times[label];
+    } else {
+      S.times = S.times || {};
+      S.times[label] = rec;
+    }
+    save();
+  }
+  function forgetLocal(label){
+    if (S.times) delete S.times[label];
+    S.extraTimes = (S.extraTimes || []).filter(function(x){ return !x || x.label !== label; });
+    save();
+  }
+  function postDates(body){
+    return fetch('/dates', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    }).then(function(r){
+      return r.json().then(function(obj){
+        if (!r.ok || !obj || obj.ok === false) throw new Error((obj && obj.error) || ('HTTP ' + r.status));
+        return obj;
+      }, function(){ throw new Error('HTTP ' + r.status); });
+    });
+  }
+  function collectTimeRec(){
+    var label = document.getElementById('time-label').value.trim();
+    return {
+      label: label,
+      started_at: fromLocalValue(document.getElementById('time-started').value),
+      expires_at: fromLocalValue(document.getElementById('time-expires').value),
+      period: currentPeriodValue(),
+      sub: document.getElementById('time-sub').value.trim()
+    };
+  }
+  document.getElementById('time-save').onclick = function(){
+    var rec = collectTimeRec();
+    if (!rec.label) { document.getElementById('time-label').focus(); return; }
+    var existing = document.querySelector('#cards [data-account="' + CSS.escape(rec.label) + '"]');
+    var isExtra = !existing || existing.getAttribute('data-extra') === '1';
+    var btn = document.getElementById('time-save');
+    if (btn.dataset.busy) return;
+    btn.dataset.busy = '1';
+    setTimeStatus('正在写入服务器…');
+    postDates(rec).then(function(){
+      forgetLocal(rec.label);
+      setTimeStatus('已写入 config.json');
+      timeModal.hidden = true;
+      return doRefresh('/refresh?account=' + encodeURIComponent(rec.label), rec.label);
+    }).catch(function(err){
+      rememberLocal(rec.label, rec, isExtra);
+      apply(); buildPanel();
+      setTimeStatus('服务器没接到（' + (err && err.message ? err.message : '无法连接') + '），先存在这个浏览器');
+    }).finally(function(){ delete btn.dataset.busy; });
+  };
+  document.getElementById('time-reset').onclick = function(){
+    var label = document.getElementById('time-label').value.trim();
+    if (label && S.times) delete S.times[label];
+    save(); apply();
+    setTimeStatus('');
+    if (label) openTimeEdit(label, false);
+  };
+  document.getElementById('time-delete').onclick = function(){
+    var label = document.getElementById('time-label').value.trim();
+    if (!label) return;
+    setTimeStatus('正在从服务器删除…');
+    postDates({label: label, delete: true}).then(function(){
+      forgetLocal(label);
+      S.order = (S.order || []).filter(function(n){ return n !== label; });
+      save();
+      timeModal.hidden = true;
+      return doRefresh('/refresh', null);
+    }).catch(function(err){
+      S.extraTimes = (S.extraTimes || []).filter(function(x){ return !x || x.label !== label; });
+      if (S.times) delete S.times[label];
+      S.order = (S.order || []).filter(function(n){ return n !== label; });
+      save(); apply(); buildPanel();
+      timeModal.hidden = true;
+      setTimeStatus('服务器没删成（' + (err && err.message ? err.message : '无法连接') + '），只从本机去掉了');
+    });
+  };
+  document.getElementById('time-copy').onclick = function(){
+    var label = document.getElementById('time-label').value.trim() || '新套餐';
+    var rec = {
+      type: 'time', label: label,
+      sub: document.getElementById('time-sub').value.trim(),
+      started_at: fromLocalValue(document.getElementById('time-started').value),
+      expires_at: fromLocalValue(document.getElementById('time-expires').value),
+      period: currentPeriodValue()
+    };
+    if (!rec.sub) delete rec.sub;
+    if (!rec.started_at) delete rec.started_at;
+    if (!rec.expires_at) delete rec.expires_at;
+    if (!rec.period) delete rec.period;
+    var text = JSON.stringify(rec, null, 2);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function(){ flash(document.getElementById('time-copy'), '已复制'); }, function(){ window.prompt('复制这段配置：', text); });
+    } else { window.prompt('复制这段配置：', text); }
+  };
+
   var shareBtn = document.getElementById('share-toggle');
   shareBtn.onclick = function(){
     document.body.classList.toggle('share-mode');
@@ -1615,9 +2717,40 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     flash(this, '已恢复');
   };
 
+  function applyCloudAccounts(list){
+    if (!Array.isArray(list)) return;
+    list.forEach(function(acc){
+      if (!acc || !acc.label) return;
+      var card = document.querySelector('#cards [data-account="' + CSS.escape(acc.label) + '"]');
+      if (!card) {
+        S.extraTimes = (S.extraTimes || []).filter(function(x){ return x && x.label !== acc.label; });
+        S.extraTimes.push({
+          label: acc.label, sub: acc.sub || '',
+          started_at: acc.started_at || '', expires_at: acc.expires_at || '',
+          period: acc.period || '', used_up: !!acc.used_up
+        });
+        return;
+      }
+      if (acc.started_at !== undefined) card.setAttribute('data-started', acc.started_at || '');
+      if (acc.expires_at !== undefined) card.setAttribute('data-expires', acc.expires_at || '');
+      if (acc.period !== undefined) card.setAttribute('data-period', acc.period || '');
+      if (acc.sub) {
+        var plan = card.querySelector('.plan');
+        if (plan) plan.textContent = acc.sub;
+      }
+      markUsedUp(card, !!acc.used_up);
+      if (S.times) delete S.times[acc.label];
+      if (S.usedUp) delete S.usedUp[acc.label];
+    });
+  }
   load();
-  apply();
-  save();
+  fetch('/dates', {credentials: 'same-origin'})
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(obj){
+      if (obj && obj.ok && obj.accounts) applyCloudAccounts(obj.accounts);
+    })
+    .catch(function(){})
+    .then(function(){ apply(); save(); buildPanel(); });
 })();
 </script>
 </body>
@@ -1642,6 +2775,14 @@ def refresh_page_state(cfg, page_state, accounts, labels=None):
     for acct in accounts:
         label = acct["label"]
         if labels is not None and label not in labels:
+            continue
+        if is_time_account(cfg, acct):
+            entry = dict(page_state["accounts"].get(label) or {})
+            entry["fetched_at"] = stamp
+            entry["track"] = "time"
+            entry["health"] = "ok"
+            entry["fetch_error"] = None
+            page_state["accounts"][label] = entry
             continue
         r = fetch_one(cfg, acct)
         if r is None:
@@ -1670,6 +2811,8 @@ def resolve_health(cfg, acct, entry, bad_set):
     claiming all-clear. People who don't run CLIProxyAPI never configure the
     management key, so they just get the verdict of our own last fetch.
     """
+    if is_time_account(cfg, acct):
+        return "ok"
     own = entry.get("health")
     if acct["type"] in ("claude", "codex"):
         if bad_set is not None and os.path.basename(acct.get("auth_file") or "") in bad_set:
@@ -1679,7 +2822,76 @@ def resolve_health(cfg, acct, entry, bad_set):
     return own or "unknown"
 
 
+def time_card_html(cfg, acct, entry, health):
+    """Same card chrome as quota cards, but the bar is elapsed subscription time."""
+    label = acct["label"]
+    tw = account_time_window(cfg, acct)
+    rows = []
+    if not tw:
+        rows.append('<div class="err">未配置 started_at / expires_at，无法计时</div>')
+    else:
+        if tw["expired"]:
+            if tw["overdue_days"]:
+                note = "已过期 %s" % fmt_span_days(tw["overdue_days"])
+            else:
+                note = "已到期"
+        elif tw["remaining_days"] is not None:
+            note = "已过 %s · 还剩 %s" % (
+                fmt_span_days(tw["elapsed_days"]), fmt_span_days(tw["remaining_days"]))
+        else:
+            note = "已过 %s" % fmt_span_days(tw["elapsed_days"])
+        rows.append(window_html(
+            cfg, time_window_label(acct), tw["elapsed_pct"], tw["end"], note,
+            elapsed=tw["elapsed_pct"], show_ticks=True,
+            end_kind="expiry", fill_cls=time_fill_class(tw)))
+
+    expiry_html = ""
+    exp = account_expiry_dt(cfg, acct)
+    if exp and (not tw or not tw["end"] or exp.date() != tw["end"].date()):
+        days = (exp.date() - now_utc().astimezone(cfg["_tz"]).date()).days
+        expiry_html = '<div class="expiry">套餐 %d 天后到期（%s）</div>' % (
+            max(days, 0), exp.date().isoformat())
+
+    badge_html = ""
+    if health is not None:
+        cls, htext = BADGE[health]
+        label_txt = "" if health == "ok" else html.escape(htext)
+        badge_html = '<span class="badge b-%s"><i class="dot"></i>%s</span>' % (cls, label_txt)
+    used_up = bool(acct.get("used_up"))
+    alert = (not used_up) and bool(tw and (tw["expired"] or (
+        tw.get("remaining_days") is not None and tw["remaining_days"] <= 7)))
+    sub_html = ""
+    if acct.get("sub"):
+        sub_html = '<span class="plan">%s</span>' % html.escape(str(acct["sub"]))
+    fetched_txt = "本地计时"
+    label_esc = html.escape(label)
+    provider_esc = html.escape(str(acct.get("type") or "time"))
+    started_raw = str(acct.get("started_at") or "")
+    expires_raw = str(acct.get("expires_at") or (cfg.get("plan_expiry") or {}).get(label) or "")
+    period_raw = "" if acct.get("period") in (None, "") else str(acct.get("period"))
+    card_cls = (" used-up" if used_up else "") + (" alert" if alert else "")
+    used_box = ('<label class="used-up-toggle"><input type="checkbox" class="used-up-box" '
+                'data-account="%s"%s> 用完了</label>'
+                % (label_esc, " checked" if used_up else ""))
+    return ('<div class="card%s" data-account="%s" data-provider="%s" data-health="%s" data-track="time" '
+            'data-started="%s" data-expires="%s" data-period="%s" data-used-up="%s">'
+            '<h2><span class="title"><span>%s</span>%s</span>'
+            '<span class="card-actions">%s<span class="drag-handle" role="button" tabindex="0" title="拖动账号调整顺序" aria-label="拖动账号调整顺序">拖动</span>'
+            '%s'
+            '<button class="mini-btn time-edit-btn" type="button" data-account="%s">改日期</button>'
+            '<a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a>'
+            '</span></h2><div class="wins">%s</div>%s<div class="fetched">%s</div></div>'
+            % (card_cls, label_esc, provider_esc, html.escape(health or "ok"),
+               html.escape(started_raw), html.escape(expires_raw), html.escape(period_raw),
+               "1" if used_up else "0",
+               label_esc, sub_html, badge_html, used_box, label_esc,
+               "/refresh?account=" + urllib.parse.quote(label), label_esc,
+               "".join(rows), expiry_html, fetched_txt))
+
+
 def card_html(cfg, acct, entry, health):
+    if is_time_account(cfg, acct):
+        return time_card_html(cfg, acct, entry, health)
     label = acct["label"]
     rows = []
     windows = entry.get("windows") or {}
@@ -1751,6 +2963,20 @@ def card_html(cfg, acct, entry, health):
                "".join(rows), expiry_html, html.escape(fetched_txt)))
 
 
+def _time_sort_key(cfg, acct):
+    """Soonest unfinished reset first; used-up and expired sink."""
+    tw = account_time_window(cfg, acct)
+    far = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    end = tw["end"] if tw and tw.get("end") else far
+    if acct.get("used_up"):
+        return (3, end)
+    if not tw or not tw.get("end"):
+        return (2, far)
+    if tw.get("expired"):
+        return (1, end)
+    return (0, end)
+
+
 def group_accounts_by_provider(accounts):
     """Keep accounts from the same provider adjacent without changing the
     provider group's first-seen position or the order inside each group."""
@@ -1766,10 +2992,13 @@ def group_accounts_by_provider(accounts):
 
 def render_page(cfg, page_state, accounts):
     """Build the HTML from cached state only — no network calls except the local
-    management-API health check."""
-    bad_set = auth_health_map(cfg)
+    management-API health check (skipped entirely in time mode)."""
+    bad_set = None if dashboard_mode(cfg) == "time" else auth_health_map(cfg)
     cards, unhealthy, healthy = [], [], 0
-    accounts = group_accounts_by_provider(accounts)
+    if dashboard_mode(cfg) == "time":
+        accounts = sorted(accounts, key=lambda acct: _time_sort_key(cfg, acct))
+    else:
+        accounts = group_accounts_by_provider(accounts)
     for acct in accounts:
         entry = page_state["accounts"].get(acct["label"]) or {}
         health = resolve_health(cfg, acct, entry, bad_set)
@@ -1781,17 +3010,35 @@ def render_page(cfg, page_state, accounts):
 
     # server-rendered fallback; the page's script recomputes this from whichever
     # cards the visitor actually kept visible
-    if unhealthy:
+    if dashboard_mode(cfg) == "time":
+        soonest = None
+        for acct in accounts:
+            tw = account_time_window(cfg, acct)
+            if not tw or not tw["end"] or tw["expired"]:
+                continue
+            if soonest is None or tw["end"] < soonest[1]:
+                soonest = (acct["label"], tw["end"], tw["remaining_days"])
+        if soonest and soonest[2] is not None:
+            summary = "%d 个套餐计时中，最近到期 %s 还有 %s" % (
+                len(accounts), soonest[0], fmt_span_days(soonest[2]))
+        else:
+            summary = "%d 个套餐计时中" % len(accounts)
+    elif unhealthy:
         summary = "%d 个异常：%s，其余正常" % (len(unhealthy), "、".join(unhealthy))
     elif healthy:
         summary = "%d/%d 正常" % (healthy, len(accounts))
     else:
         summary = "健康检查暂不可用"
 
+    mode = dashboard_mode(cfg)
+    axis = "时间进度" if mode == "time" else "使用比例"
     return (PAGE_TEMPLATE
             .replace("@TITLE@", html.escape(cfg.get("page_title") or DEFAULTS["page_title"]))
             .replace("@UPDATED@", now_utc().astimezone(cfg["_tz"]).strftime("%m月%d日 %H:%M"))
             .replace("@SUMMARY@", html.escape(summary))
+            .replace("@AXIS_LABEL@", axis)
+            .replace("@MODE@", mode)
+            .replace("@TZ@", str(int(cfg.get("timezone_offset_hours") or 8)))
             .replace("@CARDS@", "".join(cards)))
 
 
@@ -1812,15 +3059,113 @@ def cmd_page(cfg, labels=None):
 
 
 
+# ---------------------------------------------------------------- serve
+
+def cmd_serve(cfg, host="127.0.0.1", port=8791):
+    """Local-only HTTP server: static dashboard + /refresh + POST /dates.
+
+    POST /dates writes start/expiry into config.json (date fields only) and
+    regenerates the page so the next load and the next watchdog run both see
+    the new dates. Bound to 127.0.0.1 by default — put nginx in front if you
+    need it on the LAN, same as the optional /refresh example.
+    """
+    config_path = cfg.get("_config_path") or os.path.abspath("./config.json")
+    cmd_page(cfg)
+    page_dir = cfg["page_out_dir"]
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=page_dir, **kwargs)
+
+        def log_message(self, fmt, *rest):
+            log(cfg, "serve: " + (fmt % rest))
+
+        def _json(self, code, obj):
+            body = json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in ("/dates", "/dates/"):
+                live = load_config(config_path)
+                user = load_user_config(config_path)
+                return self._json(200, {
+                    "ok": True,
+                    "source": user.get("_store") or "config",
+                    "accounts": accounts_public(user.get("accounts") or live.get("accounts")),
+                })
+            if parsed.path in ("/refresh", "/refresh/"):
+                qs = urllib.parse.parse_qs(parsed.query)
+                account = (qs.get("account") or [None])[0]
+                live = load_config(config_path)
+                cmd_page(live, [account] if account else None)
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            return super().do_GET()
+
+        def do_POST(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path not in ("/dates", "/dates/"):
+                self.send_error(404, "not found")
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > 8192:
+                return self._json(413, {"ok": False, "error": "请求太大"})
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                payload = json.loads(raw.decode() or "{}")
+            except Exception:
+                return self._json(400, {"ok": False, "error": "JSON 不对"})
+            live = load_config(config_path)
+            try:
+                rec = normalize_time_record(live, payload)
+                result = apply_time_record(config_path, rec)
+            except ValueError as e:
+                return self._json(400, {"ok": False, "error": str(e)})
+            live = load_config(config_path)
+            cmd_page(live, None if rec.get("delete") else [rec["label"]])
+            self._json(200, result)
+
+    class Server(http.server.ThreadingHTTPServer):
+        allow_reuse_address = True
+
+    httpd = Server((host, port), Handler)
+    loc = "http://%s:%d/" % (host, port)
+    log(cfg, "serve listening on %s (config %s)" % (loc, config_path))
+    print("llm-quota-watchdog serve  " + loc)
+    print("config: " + config_path)
+    print("page:   " + os.path.join(page_dir, "index.html"))
+    print("GET/POST /dates  — Blob if BLOB_READ_WRITE_TOKEN is set, else config.json")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
 # ---------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser(description="llm-quota-watchdog: LLM coding-plan quota dashboard + alerts")
-    ap.add_argument("command", choices=["watchdog", "page", "check-auth"])
+    ap.add_argument("command", choices=["watchdog", "page", "check-auth", "serve"])
     ap.add_argument("--summary", action="store_true", help="watchdog: always push the full summary")
     ap.add_argument("--account", action="append", metavar="LABEL",
                     help="page: only re-query this account (repeatable); "
                          "everything else is served from the page cache")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="serve: bind address (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=8791,
+                    help="serve: port (default 8791)")
     ap.add_argument("--config", default=os.environ.get("QUOTA_WATCHDOG_CONFIG", "./config.json"))
     ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     args = ap.parse_args()
@@ -1830,6 +3175,8 @@ def main():
         cmd_watchdog(cfg, args.summary)
     elif args.command == "page":
         cmd_page(cfg, args.account)
+    elif args.command == "serve":
+        cmd_serve(cfg, args.host, args.port)
     else:
         cmd_check_auth(cfg)
 

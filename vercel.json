@@ -1,0 +1,7 @@
+{
+  "buildCommand": "python3 quota_watchdog.py page --config deploy-config.json",
+  "outputDirectory": "www",
+  "rewrites": [
+    { "source": "/dates", "destination": "/api/dates" }
+  ]
+}

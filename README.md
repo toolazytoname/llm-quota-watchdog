@@ -1,7 +1,7 @@
 # llm-quota-watchdog
 
-**One dashboard + smart push alerts for all your LLM coding-plan quotas.**
-Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan
+**One dashboard + smart push alerts for all your LLM coding-plan quotas and renewals.**
+Claude Pro/Max · Codex Plus/Pro · Kimi for Coding · GLM Coding Plan · Grok · Cursor
 
 [中文文档](README_CN.md)
 
@@ -18,6 +18,8 @@ Subscription coding plans (Claude Pro/Max, ChatGPT Codex, Kimi for Coding, Zhipu
 - Kimi for Coding has no documented quota API at all.
 
 llm-quota-watchdog polls the same endpoints the official CLIs use, renders a single static page, and pushes alerts before you burn through a window — or when you're wasting one.
+
+If you'd rather not send those tokens anywhere, set `"mode": "time"`. The dashboard keeps the same cards and bars, but each bar is **elapsed subscription time** (how long has passed / how many days left) and the tool never calls a vendor usage API. Grok and Cursor — which have no public quota endpoint — use this path too.
 
 ## What you get
 
@@ -63,7 +65,7 @@ The page also has a "refresh all" button and a per-account refresh link. These a
 | ⏱ Pace indicator | every window shows time elapsed vs. usage — fast/slow at a glance |
 | 🟡 Use it or lose it | half the window gone but usage 30+ points behind · or ≤26h to reset with ≤60% used |
 | 🟢 Refilled | window reset detected (usage dropped 30+ points) |
-| 📅 Plan expiring | 7 / 3 / 1 days before a manually-configured plan expiry date |
+| 📅 Plan expiring | 7 / 3 / 1 days before a configured plan end; time mode also pushes "which plan is due, N days left" |
 | 📊 Daily summary | full report once a day, pushed regardless |
 
 Every alert fires **once per window per cycle** (state-file dedup) — no spam.
@@ -120,6 +122,8 @@ Test it:
 ```bash
 llm-quota-watchdog watchdog --summary --config ~/.local/share/llm-quota-watchdog/config.json
 llm-quota-watchdog page --config ~/.local/share/llm-quota-watchdog/config.json
+llm-quota-watchdog serve --config ~/.local/share/llm-quota-watchdog/config.json
+# default http://127.0.0.1:8791/ — editing a date POSTs /dates back into that config.json
 ```
 
 Serve the page with any web server, e.g. nginx:
@@ -154,11 +158,12 @@ See [config.example.json](config.example.json) — every key has a sane default.
 |---|---|
 | `bark_url` / `ntfy_url` | push channel(s); either, both, or none |
 | `bark_url_file` / `ntfy_url_file` | same, but read from a file so the key stays out of config.json; the file wins if both are set |
+| `mode` | `quota` (default, poll usage APIs) or `time` (local dates only, no upstream usage calls) |
 | `page_title` | dashboard heading (default: 大模型额度监控) |
 | `cliproxyapi_auth_dir` | directory with CLIProxyAPI OAuth `*.json` files; Claude/Codex auto-discovered |
-| `accounts` | explicit account list; also the default card order. Each entry takes `label` (card title), `sub` (subtitle), `quota_factor` (real within-provider multiplier), `capacity_index` (approximate cross-provider capacity), `quota_label`/`quota_labels` (native allowance text), `api_key`/`api_key_file` (Kimi/GLM), or `auth_file` (Claude/Codex) |
+| `accounts` | explicit account list; also the default card order. Quota entries take `label` / `sub` / `quota_factor` / `capacity_index` / `quota_label` / `api_key_file` / `auth_file`. Time-only entries use `type: "time"|"grok"|"cursor"` (or `"track": "time"` on any account) plus `started_at`, `expires_at`, and optional `period` (`monthly` / `yearly` / day count) |
 | `relaxed_accounts` | labels that only get the "nearly used up" alert |
-| `plan_expiry` | `{"Kimi Coding": "2026-08-22"}` → countdown on page + expiry alerts (keyed by account label) |
+| `plan_expiry` | `{"Kimi Coding": "2027-07-23"}` → countdown on page + expiry alerts (keyed by account label) |
 | `monthly_snapshot` | monthly quota shown on the page (keyed by account label); manually-maintained unless the account has `monthly_web_token_file`, in which case it's auto-refreshed (see [Kimi monthly quota token](#kimi-monthly-quota-token)) |
 | `thresholds` | every alert threshold is tunable |
 | `timezone_offset_hours` | display/report timezone (default UTC+8) |
@@ -167,6 +172,32 @@ See [config.example.json](config.example.json) — every key has a sane default.
 | `cliproxyapi_management_url` | CLIProxyAPI management API URL, default `http://127.0.0.1:8317/v0/management/auth-files` |
 
 Leaving `accounts` empty still works: Claude/Codex are auto-discovered from `cliproxyapi_auth_dir` and each card is titled after its auth filename. Add entries to `accounts` when you want nicer titles and subtitles — an auth file you configured explicitly is not auto-discovered a second time, so listing one of your two Codex accounts by hand won't drop the other.
+
+## Time mode (no quota polling)
+
+Usage endpoints all need a token. If you'd rather not poll them — or the plan has no public quota API (Grok, Cursor) — switch to time mode:
+
+```json
+"mode": "time",
+"accounts": [
+  {
+    "type": "cursor",
+    "label": "Cursor Ultra",
+    "sub": "$200/mo",
+    "started_at": "2026-08-13",
+    "expires_at": "2026-09-13",
+    "period": "monthly"
+  }
+]
+```
+
+- Same cards and bars; the bar is **how long has elapsed**, with "N days in / M days left"
+- Each time card has **Edit dates**. With `serve` running, Save writes start/expiry into server `config.json` (date fields only, keys untouched) so the page and the next push both see the new dates
+- `watchdog` / `page` never call a vendor usage API and never scan the CLIProxyAPI auth directory
+- Pushes are expiry-only: once at 7 / 3 / 1 days left, plus a one-shot "expired" alert; if you set `period` but no `expires_at`, the current billing-cycle end is what gets pushed
+- Or leave global `mode` as `quota` and mark individual accounts `"type": "grok"` / `"type": "cursor"` / `"track": "time"` so they sit next to quota cards
+
+`period` of `monthly` / `yearly` / an integer day count tracks the **current cycle** (a sub that started on the 15th always rolls 15th→15th). `expires_at` is the hard subscription end; when it's set, pushes follow that date so a monthly prepaid year doesn't ping you at every cycle boundary.
 
 Every usage track stays full-width and means exactly 0–100% consumed, so a small plan never collapses into an unreadable sliver. `quota_factor` is the real **within-provider allowance multiplier, not a price multiplier**. `capacity_index` is a deliberately approximate cross-provider index rather than a claim that Codex messages, GLM credits, and Kimi units are the same token; when no native allowance label is configured, the page discloses it as `cross-platform ≈Nx`. Plan size appears beside the track as one of three scan-friendly tiers (up to 1x, up to 6x, or above 6x), while the exact configured multiplier or native allowance remains visible as text. Each account renders its longest available quota window first. `quota_label` supplies native allowance text. Use `quota_labels`, for example `{"5h": "12,000 credits / 5h", "7d": "60,000 credits / week"}`, when absolute totals differ by window.
 
@@ -261,7 +292,7 @@ Add your own debounce (e.g. skip re-running if the last run was <20s ago) if the
 ## FAQ
 
 **Does polling these endpoints risk my account?**
-The endpoints are the ones the official CLIs call. Once an hour from the same IP that already serves your traffic is well within normal client behavior. That said, using subscription OAuth tokens through any third-party proxy is outside the vendors' intended use — that's a pre-existing risk of your setup, not something this tool meaningfully adds to.
+The endpoints are the ones the official CLIs call. Once an hour from the same IP that already serves your traffic is well within normal client behavior. That said, using subscription OAuth tokens through any third-party proxy is outside the vendors' intended use — that's a pre-existing risk of your setup, not something this tool meaningfully adds to. To avoid usage endpoints entirely, set `"mode": "time"` and only record start / expiry dates.
 
 **Why does my Codex account only show a weekly window?**
 For Plus/ProLite plans, `wham/usage` returns the weekly limit as `primary_window`. The tool labels windows by their actual reset distance, so what you see is what your plan actually has.
