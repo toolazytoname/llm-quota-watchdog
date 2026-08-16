@@ -253,7 +253,7 @@ class TimeModeTests(unittest.TestCase):
         self.assertIn("已过 5.8 天 · 还剩 25.2 天", html)
         self.assertIn('style="width:18.82%"', html)
         self.assertIn('class="time-marker"', html)
-        self.assertIn('class="time-ticks"', html)
+        self.assertNotIn('class="time-ticks"', html)
         self.assertIn("到期", html)
         self.assertIn("本地计时", html)
         self.assertNotIn("5小时", html)

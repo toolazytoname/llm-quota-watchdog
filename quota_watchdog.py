@@ -1426,12 +1426,7 @@ def window_html(cfg, label, pct, reset, note="", elapsed=None,
         fill_width = "0" if pct is None or pct <= 0 else "%.2f%%" % min(pct, 100)
     else:
         fill_width = "0" if pct is None or pct <= 0 else "max(3px, %.1f%%)" % min(pct, 100)
-    ticks_html = ""
-    if show_ticks:
-        ticks_html = ('<div class="time-ticks" aria-hidden="true">'
-                      + "".join('<i style="left:%d%%"></i>' % p for p in (0, 25, 50, 75, 100))
-                      + "</div>")
-    marker_html = ticks_html
+    marker_html = ""
     if elapsed is not None:
         marker_html += ('<div class="time-marker" style="left:%.1f%%" title="现在"></div>'
                         % max(min(elapsed, 100), 0))
@@ -1630,9 +1625,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .fill.high { background: var(--warn); }
   .fill.crit { background: var(--bad); }
   .time-marker { position: absolute; z-index: 2; top: -4px; bottom: -4px; width: 2px; background: var(--bar-marker); box-shadow: 0 0 0 1px var(--bg); opacity: .8; border-radius: 2px; }
-  .time-ticks { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
-  .time-ticks i { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--bar-marker); opacity: .32; }
-  .time-ticks i:first-child, .time-ticks i:last-child { opacity: .55; }
   .card[data-track="time"] .time-marker { background: var(--ink); opacity: 1; }
   .meta { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
   .reset { color: var(--ink-3); font-size: 10.5px; font-family: var(--mono); }
@@ -1694,8 +1686,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   body.hide-sub .plan { display: none; }
   body.hide-reset .reset { display: none; }
   body.hide-pace .note, body.hide-pace .time-marker { display: none; }
-  body.hide-pace .card[data-track="time"] .time-marker,
-  body.hide-pace .card[data-track="time"] .time-ticks { display: block; }
+  body.hide-pace .card[data-track="time"] .time-marker { display: block; }
   body.hide-capacity .capacity { display: none; }
   body.hide-fetched .fetched { display: none; }
   body.hide-expiry .expiry { display: none; }
@@ -2076,11 +2067,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var short = timeWinLabel(period);
     var resetIso = (tw && tw.end) ? tw.end.toISOString() : '';
     var left = resetLeftTxt(tw && tw.end);
-    var ticks = '<div class="time-ticks" aria-hidden="true"><i style="left:0%"></i><i style="left:25%"></i><i style="left:50%"></i><i style="left:75%"></i><i style="left:100%"></i></div>';
     var marker = (pct === null || pct === undefined) ? '' : ('<div class="time-marker" style="left:' + Math.max(Math.min(pct, 100), 0).toFixed(1) + '%" title="现在"></div>');
     return '<div class="win" data-pct="' + (pct === null || pct === undefined ? '' : pct.toFixed(1)) + '" data-short="' + escapeHtml(short) + '" data-reset-short="' + escapeHtml(left) + '" data-reset-at="' + escapeHtml(resetIso) + '" data-capacity="" title="' + escapeHtml(short + ' / ' + resetTxt + (note ? ' / ' + note : '')) + '">' +
       '<div class="win-head"><span>' + escapeHtml(short) + '</span><span class="pct ' + fc + '">' + pctTxt + '</span></div>' +
-      '<div class="win-scale"><div class="bar"><div class="fill ' + fc + '" style="width:' + width + '"></div>' + ticks + marker + '</div></div>' +
+      '<div class="win-scale"><div class="bar"><div class="fill ' + fc + '" style="width:' + width + '"></div>' + marker + '</div></div>' +
       '<div class="meta"><span class="reset">' + escapeHtml(resetTxt) + '</span>' + (note ? '<span class="note">' + escapeHtml(note) + '</span>' : '') + '</div></div>';
   }
   function resolvedTime(card){
