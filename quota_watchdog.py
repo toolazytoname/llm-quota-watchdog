@@ -47,7 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 
 DEFAULTS = {
     "bark_url": "",                 # e.g. https://api.day.app/YOUR_KEY/
@@ -219,6 +219,23 @@ def blob_token():
     return (os.environ.get("BLOB_READ_WRITE_TOKEN") or "").strip()
 
 
+def dates_write_key():
+    """Optional shared secret for POST /dates. Empty means writes are open."""
+    return (os.environ.get("DATES_WRITE_KEY") or "").strip()
+
+
+def dates_write_authorized(headers):
+    expected = dates_write_key()
+    if not expected:
+        return True
+    got = (headers.get("X-Dates-Key") or "").strip()
+    if not got:
+        auth = headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            got = auth[7:].strip()
+    return got == expected
+
+
 def blob_store_id():
     """Store id from env, or the rw-token form vercel_blob_rw_<storeId>_…"""
     sid = (os.environ.get("BLOB_STORE_ID") or "").strip()
@@ -368,7 +385,10 @@ def load_user_config(config_path):
         # used_up write with deploy-config (no checkmarks) on every page load.
     try:
         cfg = load_config(config_path)
-        if release_stale_used_up(cfg, user.get("accounts") or []):
+        accounts = user.get("accounts") or []
+        changed = release_stale_used_up(cfg, accounts)
+        changed = advance_rolling_dates(cfg, accounts) or changed
+        if changed:
             persist_user_config(config_path, user)
     except Exception:
         pass
@@ -843,7 +863,7 @@ def infer_window_start(end, period):
         days = 0
     if days > 0:
         return end - datetime.timedelta(days=days)
-    return end - datetime.timedelta(days=7)
+    return None
 
 
 def fmt_span_days(days):
@@ -948,7 +968,9 @@ def time_window_label(acct):
         days = None
     if days:
         return "%d天周期" % days
-    return "套餐周期"
+    if acct.get("started_at"):
+        return "套餐周期"
+    return "距重置"
 
 
 def fmt_time_summary_line(cfg, acct):
@@ -1055,6 +1077,65 @@ def format_wall_time(dt):
     if dt is None:
         return ""
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def format_stored_time(dt, previous=None):
+    """Keep date-only values date-only when the stored string had no clock."""
+    if dt is None:
+        return ""
+    prev = str(previous or "")
+    if prev and "T" not in prev and not (len(prev) > 10 and " " in prev[10:]):
+        return dt.date().isoformat()
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0 and not prev:
+        return dt.date().isoformat()
+    return format_wall_time(dt)
+
+
+def shift_by_period(dt, period, steps=1):
+    if dt is None or not steps:
+        return dt
+    if period == "monthly":
+        return add_calendar_months(dt, steps, dt.day)
+    if period == "yearly":
+        return add_calendar_months(dt, 12 * steps, dt.day)
+    try:
+        days = int(period)
+    except (TypeError, ValueError):
+        return dt
+    if days <= 0:
+        return dt
+    return dt + datetime.timedelta(days=days * steps)
+
+
+def advance_rolling_dates(cfg, accounts):
+    """Walk started_at / expires_at forward when a rolling period is past.
+
+    ``expires_at`` is treated as the current cycle end (reset day), not a
+    hard subscription death date. Returns True if any stored date changed.
+    """
+    now = now_utc().astimezone(cfg["_tz"])
+    changed = False
+    for acc in accounts:
+        if not isinstance(acc, dict) or not acc.get("period"):
+            continue
+        expires = account_expiry_dt(cfg, acc)
+        if expires is None or now < expires:
+            continue
+        started = parse_local_date(cfg, acc.get("started_at"))
+        raw_exp, raw_start = acc.get("expires_at"), acc.get("started_at")
+        steps = 0
+        while expires is not None and now >= expires and steps < 240:
+            started = shift_by_period(started, acc.get("period"), 1)
+            expires = shift_by_period(expires, acc.get("period"), 1)
+            steps += 1
+        if not steps:
+            continue
+        if expires is not None:
+            acc["expires_at"] = format_stored_time(expires, raw_exp)
+        if started is not None:
+            acc["started_at"] = format_stored_time(started, raw_start)
+        changed = True
+    return changed
 
 
 def used_up_deadline(cfg, acc):
@@ -1514,11 +1595,16 @@ def quota_capacity_info(acct, window=None):
 
 def window_html(cfg, label, pct, reset, note="", elapsed=None,
                 capacity_tier=0, quota_label="", end_kind="reset",
-                fill_cls=None, show_ticks=False):
+                fill_cls=None, show_ticks=False, headline=None):
     """One quota bar. Its data attributes drive summary and client-side sorts.
     The title keeps reset time and pace reachable in the mini density, which
     hides both to stay one row tall."""
-    pct_txt = "未知" if pct is None else ("%.2f%%" % pct if pct < 10 else "%.1f%%" % pct)
+    if headline:
+        pct_txt = headline
+    elif pct is None:
+        pct_txt = "未知"
+    else:
+        pct_txt = "%.2f%%" % pct if pct < 10 else "%.1f%%" % pct
     if show_ticks:
         fill_width = "0" if pct is None or pct <= 0 else "%.2f%%" % min(pct, 100)
     else:
@@ -1592,9 +1678,6 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>@TITLE@</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   /* Two themes share this one stylesheet: a polished dark (A) and a warm light
      (C). The page defaults to the OS preference and lets the visitor pin one.
@@ -1613,8 +1696,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --accent: #3ecf8e; --accent-ink: #04130c;
     --warn: #f5a524; --bad: #f87171; --good: #3ecf8e;
     --summary-bg: #131518; --summary-border: #1e2024;
-    --ui-font: "Space Grotesk"; --num-weight: 300;
-    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --ui-font: -apple-system, "Segoe UI"; --num-weight: 500;
+    --mono: "SF Mono", Menlo, Consolas, monospace;
     --radius: 16px;
   }
   @media (prefers-color-scheme: light) {
@@ -1629,7 +1712,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       --accent: #4f9d7a; --accent-ink: #ffffff;
       --warn: #d18a3e; --bad: #c0492f; --good: #4f9d7a;
       --summary-bg: #ffffff; --summary-border: #eceae4;
-      --ui-font: "Manrope"; --num-weight: 600;
+      --ui-font: -apple-system, "Segoe UI"; --num-weight: 600;
     }
   }
   body.theme-dark {
@@ -1640,7 +1723,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --bar-track: #303640; --bar-track-border: rgba(255,255,255,.075); --bar-marker: #d7dbe1;
     --capacity-track: #191c21; --capacity-on: #9ca3af;
     --accent: #3ecf8e; --accent-ink: #04130c; --warn: #f5a524; --bad: #f87171; --good: #3ecf8e;
-    --summary-bg: #131518; --summary-border: #1e2024; --ui-font: "Space Grotesk"; --num-weight: 300;
+    --summary-bg: #131518; --summary-border: #1e2024; --ui-font: -apple-system, "Segoe UI"; --num-weight: 500;
   }
   body.theme-light {
     --bg: #f7f6f3; --bg-2: #ffffff; --card: #ffffff; --card-border: #eceae4;
@@ -1650,7 +1733,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --bar-track: #ddd9d0; --bar-track-border: rgba(43,42,39,.09); --bar-marker: #5d5b55;
     --capacity-track: #f4f2ed; --capacity-on: #8d8a82;
     --accent: #4f9d7a; --accent-ink: #ffffff; --warn: #d18a3e; --bad: #c0492f; --good: #4f9d7a;
-    --summary-bg: #ffffff; --summary-border: #eceae4; --ui-font: "Manrope"; --num-weight: 600;
+    --summary-bg: #ffffff; --summary-border: #eceae4; --ui-font: -apple-system, "Segoe UI"; --num-weight: 600;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--ink); font-family: var(--ui-font), -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; padding: 28px 32px; max-width: 1440px; margin: 0 auto; -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums; transition: background .25s, color .25s; }
@@ -1822,22 +1905,34 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .set-field input[type="number"] { max-width: 120px; }
   .set-field input:disabled { opacity: .55; }
   #time-days-row[hidden], #time-delete[hidden] { display: none; }
+  .save-flash { color: var(--good); font-size: 11px; font-weight: 500; margin-left: 2px; }
+  .save-flash.err { color: var(--bad); }
+  .used-up-toggle { position: relative; }
+
+  /* time mode: one full-width bar, no leftover quota chrome */
+  body.mode-time .axis-grid { grid-template-columns: 1fr; }
+  body.mode-time .axis-grid .usage-axis:nth-child(n+2) { display: none; }
+  body.mode-time #cards .wins { grid-template-columns: minmax(0, 1fr); }
+  body.mode-time .card .refresh-link { display: none; }
+  body.mode-time #set-refresh-row,
+  body.mode-time .time-hide,
+  body.mode-time .fetched { display: none; }
 </style>
 </head>
-<body class="d-comfy">
+<body class="d-comfy mode-@MODE@">
 <header class="top">
   <h1>@TITLE@</h1>
   <span class="updated" id="updated">@UPDATED@ · llm-quota-watchdog</span>
 </header>
 <div id="summary" class="summary">@SUMMARY@</div>
 <div class="controls">
-  <a class="btn primary refresh-link" href="/refresh">刷新全部</a>
+  @TOOL_PRIMARY@
   <button class="btn" id="share-toggle" title="隐藏邮箱、时间戳等可识别信息，方便截图分享">隐私模式</button>
   <button class="btn" id="add-time" title="添加一张套餐，或给已有套餐改开始/到期日">添加 / 改日期</button>
   <button class="btn" id="open-settings"><svg class="gear" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.2v2M8 12.8v2M1.2 8h2M12.8 8h2M3.3 3.3l1.4 1.4M11.3 11.3l1.4 1.4M3.3 12.7l1.4-1.4M11.3 4.7l1.4-1.4"/></svg>显示设置</button>
 </div>
 <div id="chart-guide">
-  <span class="guide-title">套餐 / 周期从长到短</span>
+  <span class="guide-title">@GUIDE_TITLE@</span>
   <div class="axis-grid" aria-label="每条轨道均表示从零到百分之百的使用比例">
     <div class="usage-axis"><span>@AXIS_LABEL@</span><span>100%</span></div>
     <div class="usage-axis" aria-hidden="true"><span>@AXIS_LABEL@</span><span>100%</span></div>
@@ -1860,7 +1955,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <option value="usage">按用量高低（告急置顶）</option>
       <option value="custom">自定义顺序</option>
     </select></div>
-    <div class="set-row"><span>自动刷新</span><select id="set-refresh">
+    <div class="set-row" id="set-refresh-row"><span>自动刷新</span><select id="set-refresh">
       <option value="0">关闭</option><option value="300">5分钟</option><option value="900">15分钟</option>
       <option value="1800">30分钟</option><option value="3600">1小时</option><option value="10800">3小时</option>
     </select></div>
@@ -1881,7 +1976,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="set-btns">
       <button class="mini-btn" id="set-reset">恢复默认</button>
     </div>
-    <div class="set-hint">设置只存在这个浏览器里（localStorage），不会上传，也不影响别人看到的页面。换电脑时用「下载文件」带走，「上传文件」恢复。</div>
+    <div class="set-hint">主题、排序、显隐只存在这个浏览器。日期和「用完了」写在云端，换设备打开同一网站就能看到。</div>
   </div>
 </div>
 
@@ -1899,7 +1994,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       <option value="days">自定义天数</option>
     </select></div>
     <div class="set-field" id="time-days-row" hidden><span>每期天数</span><input id="time-days" type="number" min="1" max="3660" placeholder="30"></div>
-    <div class="set-hint">点保存会写入服务器上的 config.json（只改开始/到期日，不动 API key）。没有 <code>serve</code> 接口时会退回只存在这个浏览器。</div>
+    <div class="set-hint">点保存会写入云端（只改开始/到期日和用完状态）。写不进去时先留在这个浏览器，下次打开仍会再试。</div>
     <div class="set-hint" id="time-save-status"></div>
     <div class="set-btns">
       <button class="mini-btn" id="time-save">保存到服务器</button>
@@ -2091,7 +2186,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       else if (period === 'yearly') start = addMonths(end, -12, (function(){ var t = new Date(end.getTime() + tzHours() * 3600000); return t.getUTCDate(); })());
       else {
         var pd = parseInt(period, 10);
-        start = new Date(end.getTime() - ((pd > 0) ? pd : 7) * 86400000);
+        if (pd > 0) start = new Date(end.getTime() - pd * 86400000);
       }
     }
     if (!start && !end) return null;
@@ -2108,6 +2203,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     } else if (start) {
       elapsedPct = 0;
       elapsedDays = Math.max(0, (now - start) / 86400000);
+    } else if (end) {
+      remainingDays = Math.max(0, (end - now) / 86400000);
     }
     if (expired && end) overdueDays = Math.max(0, (now - end) / 86400000);
     return {start: start, end: end, elapsedPct: elapsedPct, elapsedDays: elapsedDays,
@@ -2122,11 +2219,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     if (days >= 10 && Math.abs(days - Math.round(days)) < 0.05) return Math.round(days) + ' 天';
     return days.toFixed(1) + ' 天';
   }
-  function timeWinLabel(period){
+  function timeWinLabel(period, started){
     if (period === 'monthly') return '本月周期';
     if (period === 'yearly') return '本年周期';
     var d = parseInt(period, 10);
-    return d ? (d + '天周期') : '套餐周期';
+    if (d) return d + '天周期';
+    return started ? '套餐周期' : '距重置';
   }
   function resetLeftTxt(end){
     if (!end) return '';
@@ -2152,17 +2250,23 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
     });
   }
-  function winHtml(tw, period){
+  function winHtml(tw, period, started){
     var fc = fillCls(tw);
     var pct = tw && tw.elapsedPct;
-    var pctTxt = (pct === null || pct === undefined) ? '未知' : (pct < 10 ? pct.toFixed(2) : pct.toFixed(1)) + '%';
+    var pctTxt;
+    if (pct === null || pct === undefined) {
+      pctTxt = (tw && !tw.expired && tw.remainingDays !== null) ? fmtSpanDays(tw.remainingDays) : '未知';
+    } else {
+      pctTxt = (pct < 10 ? pct.toFixed(2) : pct.toFixed(1)) + '%';
+    }
     var width = (pct === null || pct === undefined || pct <= 0) ? '0' : (Math.min(pct, 100).toFixed(2) + '%');
     var note = '';
     if (tw && tw.expired) note = tw.overdueDays ? ('已过期 ' + fmtSpanDays(tw.overdueDays)) : '已到期';
+    else if (tw && (pct === null || pct === undefined) && tw.remainingDays !== null) note = '还剩至重置';
     else if (tw && tw.remainingDays !== null) note = '已过 ' + fmtSpanDays(tw.elapsedDays) + ' · 还剩 ' + fmtSpanDays(tw.remainingDays);
     else if (tw) note = '已过 ' + fmtSpanDays(tw.elapsedDays);
     var resetTxt = fmtExpiry(tw && tw.end);
-    var short = timeWinLabel(period);
+    var short = timeWinLabel(period, started);
     var resetIso = (tw && tw.end) ? tw.end.toISOString() : '';
     var left = resetLeftTxt(tw && tw.end);
     var marker = (pct === null || pct === undefined) ? '' : ('<div class="time-marker" style="left:' + Math.max(Math.min(pct, 100), 0).toFixed(1) + '%" title="现在"></div>');
@@ -2240,7 +2344,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var box = card.querySelector('.wins');
     if (!box) return;
     if (!tw) box.innerHTML = '<div class="err">未配置 started_at / expires_at，无法计时</div>';
-    else box.innerHTML = winHtml(tw, spec.period);
+    else box.innerHTML = winHtml(tw, spec.period, spec.started);
     var used = isUsedUp(card);
     markUsedUp(card, used);
     card.classList.toggle('alert', !used && !!(tw && (tw.expired || (tw.remainingDays !== null && tw.remainingDays <= 7))));
@@ -2254,11 +2358,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var used = !!(item.used_up);
     return '<div class="card' + (used ? ' used-up' : '') + '" data-account="' + escapeHtml(label) + '" data-provider="time" data-health="ok" data-track="time" data-extra="1" data-started="' + escapeHtml(item.started_at || '') + '" data-expires="' + escapeHtml(item.expires_at || '') + '" data-period="' + escapeHtml(item.period || '') + '" data-used-up="' + (used ? '1' : '0') + '" data-used-until="' + escapeHtml(item.used_up_until || '') + '">' +
       '<h2><span class="title"><span>' + escapeHtml(label) + '</span>' + (item.sub ? '<span class="plan">' + escapeHtml(item.sub) + '</span>' : '') + '</span>' +
-      '<span class="card-actions"><span class="badge b-ok"><i class="dot"></i></span>' +
+      '<span class="card-actions">' +
       '<span class="drag-handle" role="button" tabindex="0" title="拖动账号调整顺序" aria-label="拖动账号调整顺序">拖动</span>' +
       '<label class="used-up-toggle"><input type="checkbox" class="used-up-box" data-account="' + escapeHtml(label) + '"' + (used ? ' checked' : '') + '> 用完了</label>' +
       '<button class="mini-btn time-edit-btn" type="button" data-account="' + escapeHtml(label) + '">改日期</button></span></h2>' +
-      '<div class="wins"></div><div class="fetched">本地计时 · 仅此浏览器</div></div>';
+      '<div class="wins"></div><div class="fetched">点进度条可改日期</div></div>';
   }
   function injectExtraTimes(){
     var host = document.getElementById('cards');
@@ -2335,9 +2439,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       });
     });
     var head;
-    if (bad.length) head = bad.length + ' 个异常：' + bad.join('、');
+    if (mode === 'time') head = vis.length + ' 个套餐计时中';
+    else if (bad.length) head = bad.length + ' 个异常：' + bad.join('、');
     else if (ok) head = ok + '/' + vis.length + ' 正常';
-    else if (mode === 'time') head = vis.length + ' 个套餐计时中';
     else head = '健康检查暂不可用';
     if (worst && mode === 'time') {
       head += '，最近到期 ' + worst.acct + (worst.reset ? ' ' + worst.reset : '');
@@ -2356,6 +2460,15 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     document.getElementById('set-density').value = S.density;
     document.getElementById('set-sort').value = S.sort;
     document.getElementById('set-refresh').value = String(S.autoRefresh);
+    var pageMode = (document.getElementById('cards') && document.getElementById('cards').getAttribute('data-mode')) || '';
+    var sortSel = document.getElementById('set-sort');
+    [].forEach.call(sortSel.options, function(opt){
+      opt.hidden = pageMode === 'time' && (opt.value === 'waste' || opt.value === 'usage');
+    });
+    if (pageMode === 'time' && (S.sort === 'waste' || S.sort === 'usage')) {
+      S.sort = 'expiry';
+      sortSel.value = 'expiry';
+    }
 
     var box = document.getElementById('set-accounts');
     box.innerHTML = '';
@@ -2423,13 +2536,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var showBox = document.getElementById('set-show');
     showBox.innerHTML = '';
     SHOW.forEach(function(p){
+      if (pageMode === 'time' && (p[0] === 'badge' || p[0] === 'capacity')) return;
       var lab = document.createElement('label');
       var cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.checked = !!S.show[p[0]];
       cb.onchange = function(){ S.show[p[0]] = cb.checked; save(); apply(); };
       lab.appendChild(cb);
-      lab.appendChild(document.createTextNode(p[1]));
+      lab.appendChild(document.createTextNode(p[0] === 'pace' && pageMode === 'time' ? '时间刻度' : p[1]));
       showBox.appendChild(lab);
     });
   }
@@ -2454,11 +2568,26 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     buildPanel(); // ...and may have added or removed an account
   }
 
+  function pageMode(){
+    return (document.getElementById('cards') && document.getElementById('cards').getAttribute('data-mode')) || '';
+  }
+  function reloadDates(){
+    return fetch('/dates', {credentials: 'same-origin'})
+      .then(function(r){ return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
+      .then(function(obj){
+        if (obj && obj.ok && obj.accounts) applyCloudAccounts(obj.accounts);
+        apply(); save(); buildPanel();
+        return obj;
+      });
+  }
   function doRefresh(url, account){
+    if (pageMode() === 'time') return reloadDates();
     return fetch(url, {credentials: 'same-origin'})
-      .then(function(r){ return r.text(); })
-      .then(function(text){ patchFromHtml(text, account); })
-      .catch(function(){ location.href = url; });
+      .then(function(r){
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text();
+      })
+      .then(function(text){ patchFromHtml(text, account); });
   }
 
   document.addEventListener('click', function(e){
@@ -2477,9 +2606,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   function arm(v){
     if (timer) clearTimeout(timer);
     v = parseInt(v, 10) || 0;
+    if (pageMode() === 'time') return;
     if (v > 0) {
       timer = setTimeout(function(){
-        doRefresh('/refresh', null).then(function(){ arm(v); });
+        doRefresh('/refresh', null).then(function(){ arm(v); }).catch(function(){ arm(v); });
       }, v * 1000);
     }
   }
@@ -2683,8 +2813,29 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }
     save();
     apply();
-    postDates({label: label, used_up: on}).catch(function(){ /* local usedUp already saved */ });
+    flashNear(box.closest('.used-up-toggle') || box, '保存中…', false);
+    postDates({label: label, used_up: on}).then(function(){
+      flashNear(box.closest('.used-up-toggle') || box, '已保存', false);
+    }).catch(function(err){
+      flashNear(box.closest('.used-up-toggle') || box, (err && err.message) || '没存上', true);
+    });
   });
+  function flashNear(el, text, isErr){
+    if (!el) return;
+    var old = el.querySelector('.save-flash');
+    if (old) old.parentNode.removeChild(old);
+    var n = document.createElement('span');
+    n.className = 'save-flash' + (isErr ? ' err' : '');
+    n.textContent = text;
+    el.appendChild(n);
+    setTimeout(function(){ if (n.parentNode) n.parentNode.removeChild(n); }, 1800);
+  }
+  function writeKey(){
+    try { return localStorage.getItem('datesWriteKey') || ''; } catch (e) { return ''; }
+  }
+  function setWriteKey(k){
+    try { if (k) localStorage.setItem('datesWriteKey', k); } catch (e) {}
+  }
   function setTimeStatus(text){
     var el = document.getElementById('time-save-status');
     if (el) el.textContent = text || '';
@@ -2706,15 +2857,33 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     save();
   }
   function postDates(body){
-    return fetch('/dates', {
-      method: 'POST', credentials: 'same-origin',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body)
-    }).then(function(r){
-      return r.json().then(function(obj){
-        if (!r.ok || !obj || obj.ok === false) throw new Error((obj && obj.error) || ('HTTP ' + r.status));
-        return obj;
-      }, function(){ throw new Error('HTTP ' + r.status); });
+    function send(key){
+      var headers = {'Content-Type': 'application/json'};
+      if (key) headers['X-Dates-Key'] = key;
+      return fetch('/dates', {
+        method: 'POST', credentials: 'same-origin',
+        headers: headers,
+        body: JSON.stringify(body)
+      }).then(function(r){
+        return r.json().then(function(obj){
+          if (r.status === 401) {
+            var err = new Error((obj && obj.error) || '需要写入密钥');
+            err.code = 401;
+            throw err;
+          }
+          if (!r.ok || !obj || obj.ok === false) throw new Error((obj && obj.error) || ('HTTP ' + r.status));
+          return obj;
+        }, function(){ throw new Error('HTTP ' + r.status); });
+      });
+    }
+    return send(writeKey()).catch(function(err){
+      if (err && err.code === 401) {
+        var k = window.prompt('保存到云端需要写入密钥（只问一次，存在这个浏览器）');
+        if (!k) throw err;
+        setWriteKey(k);
+        return send(k);
+      }
+      throw err;
     });
   }
   function collectTimeRec(){
@@ -2736,11 +2905,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     if (btn.dataset.busy) return;
     btn.dataset.busy = '1';
     setTimeStatus('正在写入服务器…');
-    postDates(rec).then(function(){
+    postDates(rec).then(function(obj){
       forgetLocal(rec.label);
-      setTimeStatus('已写入 config.json');
+      if (obj && obj.account) applyCloudAccounts([obj.account]);
+      apply(); buildPanel();
+      setTimeStatus('已保存到云端');
       timeModal.hidden = true;
-      return doRefresh('/refresh?account=' + encodeURIComponent(rec.label), rec.label);
     }).catch(function(err){
       rememberLocal(rec.label, rec, isExtra);
       apply(); buildPanel();
@@ -2762,8 +2932,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       forgetLocal(label);
       S.order = (S.order || []).filter(function(n){ return n !== label; });
       save();
+      var card = document.querySelector('#cards [data-account="' + CSS.escape(label) + '"]');
+      if (card && card.parentNode) card.parentNode.removeChild(card);
+      apply(); buildPanel();
       timeModal.hidden = true;
-      return doRefresh('/refresh', null);
     }).catch(function(err){
       S.extraTimes = (S.extraTimes || []).filter(function(x){ return !x || x.label !== label; });
       if (S.times) delete S.times[label];
@@ -2877,9 +3049,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         else delete S.usedUpUntil[acc.label];
         return;
       }
-      if (acc.started_at !== undefined) card.setAttribute('data-started', acc.started_at || '');
-      if (acc.expires_at !== undefined) card.setAttribute('data-expires', acc.expires_at || '');
-      if (acc.period !== undefined) card.setAttribute('data-period', acc.period || '');
+      card.setAttribute('data-started', acc.started_at || '');
+      card.setAttribute('data-expires', acc.expires_at || '');
+      card.setAttribute('data-period', acc.period || '');
       if (acc.sub) {
         var plan = card.querySelector('.plan');
         if (plan) plan.textContent = acc.sub;
@@ -2905,6 +3077,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     })
     .catch(function(){})
     .then(function(){ apply(); save(); buildPanel(); });
+  var syncBtn = document.getElementById('sync-dates');
+  if (syncBtn) {
+    syncBtn.onclick = function(){
+      if (syncBtn.dataset.busy) return;
+      syncBtn.dataset.busy = '1';
+      var prev = syncBtn.textContent;
+      syncBtn.textContent = '同步中…';
+      reloadDates().then(function(){ flash(syncBtn, '已同步'); }, function(){ flash(syncBtn, '同步失败'); })
+        .then(function(){ syncBtn.textContent = prev; delete syncBtn.dataset.busy; });
+    };
+  }
   document.addEventListener('visibilitychange', function(){
     if (!document.hidden) apply();
   });
@@ -2988,11 +3171,15 @@ def time_card_html(cfg, acct, entry, health):
     if not tw:
         rows.append('<div class="err">未配置 started_at / expires_at，无法计时</div>')
     else:
+        headline = None
         if tw["expired"]:
             if tw["overdue_days"]:
                 note = "已过期 %s" % fmt_span_days(tw["overdue_days"])
             else:
                 note = "已到期"
+        elif tw["elapsed_pct"] is None and tw["remaining_days"] is not None:
+            note = "还剩至重置"
+            headline = fmt_span_days(tw["remaining_days"])
         elif tw["remaining_days"] is not None:
             note = "已过 %s · 还剩 %s" % (
                 fmt_span_days(tw["elapsed_days"]), fmt_span_days(tw["remaining_days"]))
@@ -3001,7 +3188,8 @@ def time_card_html(cfg, acct, entry, health):
         rows.append(window_html(
             cfg, time_window_label(acct), tw["elapsed_pct"], tw["end"], note,
             elapsed=tw["elapsed_pct"], show_ticks=True,
-            end_kind="expiry", fill_cls=time_fill_class(tw)))
+            end_kind="expiry", fill_cls=time_fill_class(tw),
+            headline=headline))
 
     expiry_html = ""
     exp = account_expiry_dt(cfg, acct)
@@ -3011,17 +3199,17 @@ def time_card_html(cfg, acct, entry, health):
             max(days, 0), exp.date().isoformat())
 
     badge_html = ""
-    if health is not None:
+    if health is not None and health != "ok":
         cls, htext = BADGE[health]
-        label_txt = "" if health == "ok" else html.escape(htext)
-        badge_html = '<span class="badge b-%s"><i class="dot"></i>%s</span>' % (cls, label_txt)
+        badge_html = '<span class="badge b-%s"><i class="dot"></i>%s</span>' % (
+            cls, html.escape(htext))
     used_up = bool(acct.get("used_up"))
     alert = (not used_up) and bool(tw and (tw["expired"] or (
         tw.get("remaining_days") is not None and tw["remaining_days"] <= 7)))
     sub_html = ""
     if acct.get("sub"):
         sub_html = '<span class="plan">%s</span>' % html.escape(str(acct["sub"]))
-    fetched_txt = "本地计时"
+    fetched_txt = "点进度条可改日期"
     label_esc = html.escape(label)
     provider_esc = html.escape(str(acct.get("type") or "time"))
     started_raw = str(acct.get("started_at") or "")
@@ -3038,13 +3226,11 @@ def time_card_html(cfg, acct, entry, health):
             '<span class="card-actions">%s<span class="drag-handle" role="button" tabindex="0" title="拖动账号调整顺序" aria-label="拖动账号调整顺序">拖动</span>'
             '%s'
             '<button class="mini-btn time-edit-btn" type="button" data-account="%s">改日期</button>'
-            '<a class="mini-btn refresh-link" href="%s" data-account="%s">刷新</a>'
             '</span></h2><div class="wins">%s</div>%s<div class="fetched">%s</div></div>'
             % (card_cls, label_esc, provider_esc, html.escape(health or "ok"),
                html.escape(started_raw), html.escape(expires_raw), html.escape(period_raw),
                "1" if used_up else "0", html.escape(used_until_raw),
                label_esc, sub_html, badge_html, used_box, label_esc,
-               "/refresh?account=" + urllib.parse.quote(label), label_esc,
                "".join(rows), expiry_html, fetched_txt))
 
 
@@ -3196,7 +3382,12 @@ def render_page(cfg, page_state, accounts):
             .replace("@UPDATED@", now_utc().astimezone(cfg["_tz"]).strftime("%m月%d日 %H:%M"))
             .replace("@SUMMARY@", html.escape(summary))
             .replace("@AXIS_LABEL@", axis)
+            .replace("@GUIDE_TITLE@", "套餐" if mode == "time" else "套餐 / 周期从长到短")
             .replace("@MODE@", mode)
+            .replace("@TOOL_PRIMARY@",
+                     '<button class="btn" type="button" id="sync-dates" title="从云端重新拉取日期和用完状态">同步云端</button>'
+                     if mode == "time" else
+                     '<a class="btn primary refresh-link" href="/refresh">刷新全部</a>')
             .replace("@TZ@", str(int(cfg.get("timezone_offset_hours") or 8)))
             .replace("@CARDS@", "".join(cards)))
 
@@ -3286,6 +3477,8 @@ def cmd_serve(cfg, host="127.0.0.1", port=8791):
                 payload = json.loads(raw.decode() or "{}")
             except Exception:
                 return self._json(400, {"ok": False, "error": "JSON 不对"})
+            if not dates_write_authorized(self.headers):
+                return self._json(401, {"ok": False, "error": "需要写入密钥"})
             live = load_config(config_path)
             try:
                 rec = normalize_time_record(live, payload)

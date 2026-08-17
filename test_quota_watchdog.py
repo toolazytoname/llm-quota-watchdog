@@ -31,7 +31,7 @@ class QuotaScaleTests(unittest.TestCase):
         self.assertIn('id="chart-guide"', q.PAGE_TEMPLATE)
         self.assertIn('class="usage-axis"', q.PAGE_TEMPLATE)
         self.assertNotIn('class="capacity-axis"', q.PAGE_TEMPLATE)
-        self.assertIn('<body class="d-comfy">', q.PAGE_TEMPLATE)
+        self.assertIn('<body class="d-comfy mode-@MODE@">', q.PAGE_TEMPLATE)
         self.assertNotIn('id="set-cols"', q.PAGE_TEMPLATE)
 
     def test_capacity_uses_three_tiers_without_changing_track_width(self):
@@ -255,7 +255,7 @@ class TimeModeTests(unittest.TestCase):
         self.assertIn('class="time-marker"', html)
         self.assertNotIn('class="time-ticks"', html)
         self.assertIn("到期", html)
-        self.assertIn("本地计时", html)
+        self.assertIn("点进度条可改日期", html)
         self.assertNotIn("5小时", html)
         self.assertIn('data-started="2026-08-15"', html)
         self.assertIn('data-expires="2026-09-15"', html)
@@ -270,6 +270,8 @@ class TimeModeTests(unittest.TestCase):
         self.assertIn("function sweepUsedUp()", q.PAGE_TEMPLATE)
         self.assertIn("fetch('/dates'", q.PAGE_TEMPLATE)
         self.assertIn("保存到服务器", q.PAGE_TEMPLATE)
+        self.assertIn("@TOOL_PRIMARY@", q.PAGE_TEMPLATE)
+        self.assertIn("body.mode-time #cards .wins", q.PAGE_TEMPLATE)
 
     def test_used_up_releases_after_bound_reset(self):
         acc = {
@@ -597,17 +599,40 @@ class TimeModeTests(unittest.TestCase):
         self.assertIn("GLM Coding", results)
         self.assertNotIn("Grok SuperGrok", results)
 
-    def test_lone_expiry_still_gets_a_now_marker(self):
+    def test_lone_expiry_does_not_invent_a_seven_day_window(self):
         acct = {"type": "grok", "label": "Grok", "expires_at": "2026-08-19T20:12:00"}
         now = datetime.datetime(2026, 8, 16, 12, 0, tzinfo=datetime.timezone.utc)
         with mock.patch.object(q, "now_utc", return_value=now):
             tw = q.account_time_window(self.cfg, acct)
             html = q.card_html(self.cfg, acct, {"health": "ok"}, "ok")
         self.assertFalse(tw["expired"])
-        self.assertIsNotNone(tw["elapsed_pct"])
-        self.assertGreater(tw["elapsed_pct"], 0)
-        self.assertIn('class="time-marker"', html)
-        self.assertIn('title="现在"', html)
+        self.assertIsNone(tw["start"])
+        self.assertIsNone(tw["elapsed_pct"])
+        self.assertAlmostEqual(tw["remaining_days"], 3 + 12 / 1440.0, places=2)
+        self.assertIn("还剩至重置", html)
+        self.assertIn("距重置", html)
+        self.assertNotIn("刷新", html)
+
+    def test_rolling_monthly_dates_advance_after_reset(self):
+        acc = {
+            "type": "time", "label": "Kimi K3",
+            "started_at": "2026-07-22", "expires_at": "2026-08-22",
+            "period": "monthly",
+        }
+        now = datetime.datetime(2026, 8, 23, 4, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(q, "now_utc", return_value=now):
+            changed = q.advance_rolling_dates(self.cfg, [acc])
+        self.assertTrue(changed)
+        self.assertEqual(acc["started_at"], "2026-08-22")
+        self.assertEqual(acc["expires_at"], "2026-09-22")
+
+    def test_write_key_required_only_when_configured(self):
+        with mock.patch.object(q, "dates_write_key", return_value=""):
+            self.assertTrue(q.dates_write_authorized({}))
+        with mock.patch.object(q, "dates_write_key", return_value="secret"):
+            self.assertFalse(q.dates_write_authorized({}))
+            self.assertTrue(q.dates_write_authorized({"X-Dates-Key": "secret"}))
+            self.assertTrue(q.dates_write_authorized({"Authorization": "Bearer secret"}))
 
     def test_time_mode_page_sorts_soonest_expiry_first(self):
         self.cfg["accounts"] = [
@@ -629,9 +654,13 @@ class TimeModeTests(unittest.TestCase):
             html = q.render_page(self.cfg, page_state, q.account_list(self.cfg))
         health.assert_not_called()
         self.assertIn('data-mode="time"', html)
+        self.assertIn('class="d-comfy mode-time"', html)
         self.assertIn(">时间进度<", html)
+        self.assertIn(">套餐<", html)
         self.assertIn("最近到期 Grok SuperGrok 还有 25.2 天", html)
         self.assertIn('data-track="time"', html)
+        self.assertIn("同步云端", html)
+        self.assertNotIn("刷新全部", html)
 
 
 if __name__ == "__main__":

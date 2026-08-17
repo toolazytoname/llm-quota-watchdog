@@ -28,6 +28,13 @@ class handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         user = q.load_user_config(CONFIG)
         _send(self, 200, {
@@ -37,6 +44,8 @@ class handler(BaseHTTPRequestHandler):
         })
 
     def do_POST(self):
+        if not q.dates_write_authorized(self.headers):
+            return _send(self, 401, {"ok": False, "error": "需要写入密钥"})
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
