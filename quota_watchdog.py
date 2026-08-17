@@ -2076,17 +2076,19 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
   function expiryRank(card){
     if (isUsedUp(card)) return {tier: 2, resetAt: Infinity, remaining: 0};
-    // Cards render quota windows longest-first. Sort by that primary window;
-    // a frequently-resetting 5h allowance must not outrank a monthly/weekly one.
+    // Prefer the first window (longest quota, or the only time bar). A missing
+    // percent (reset-only cards) must still sort by reset time — not sink.
     var w = card.querySelector('.win');
     if (!w) return {tier: 3, resetAt: Infinity, remaining: 0};
-    var pct = parseFloat(w.getAttribute('data-pct'));
-    if (isNaN(pct)) return {tier: 3, resetAt: Infinity, remaining: 0};
-    var remaining = Math.max(0, 100 - pct);
-    if (remaining <= 0.001) return {tier: 2, resetAt: Infinity, remaining: 0};
     var resetAt = Date.parse(w.getAttribute('data-reset-at') || '');
-    if (isNaN(resetAt)) return {tier: 1, resetAt: Infinity, remaining: remaining};
-    return {tier: 0, resetAt: resetAt, remaining: remaining};
+    var pct = parseFloat(w.getAttribute('data-pct'));
+    var remaining = isNaN(pct) ? null : Math.max(0, 100 - pct);
+    if (remaining !== null && remaining <= 0.001) return {tier: 2, resetAt: isNaN(resetAt) ? Infinity : resetAt, remaining: 0};
+    if (!isNaN(resetAt)) {
+      return {tier: resetAt <= Date.now() ? 1 : 0, resetAt: resetAt, remaining: remaining || 0};
+    }
+    if (remaining === null) return {tier: 3, resetAt: Infinity, remaining: 0};
+    return {tier: 1, resetAt: Infinity, remaining: remaining};
   }
 
   function compareExpiryRank(a, b){

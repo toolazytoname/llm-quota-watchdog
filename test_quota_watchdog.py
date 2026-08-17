@@ -162,9 +162,9 @@ class QuotaScaleTests(unittest.TestCase):
         self.assertIn('<option value="waste">按浪费速度</option>', q.PAGE_TEMPLATE)
         self.assertIn("function expiryRank(card)", q.PAGE_TEMPLATE)
         self.assertIn("var w = card.querySelector('.win')", q.PAGE_TEMPLATE)
-        self.assertIn("a frequently-resetting 5h allowance must not outrank", q.PAGE_TEMPLATE)
+        self.assertIn("reset-only cards", q.PAGE_TEMPLATE)
         self.assertIn("function compareExpiryRank(a, b)", q.PAGE_TEMPLATE)
-        self.assertIn("if (remaining <= 0.001) return {tier: 2", q.PAGE_TEMPLATE)
+        self.assertIn("if (remaining !== null && remaining <= 0.001)", q.PAGE_TEMPLATE)
         self.assertIn("S.sort === 'expiry'", q.PAGE_TEMPLATE)
         self.assertIn("function wasteScore(card)", q.PAGE_TEMPLATE)
         self.assertIn("function groupedOrder(compare)", q.PAGE_TEMPLATE)
@@ -645,6 +645,18 @@ class TimeModeTests(unittest.TestCase):
         with mock.patch.object(q, "now_utc", return_value=now):
             ordered = sorted(self.cfg["accounts"], key=lambda a: q._time_sort_key(self.cfg, a))
         self.assertEqual([a["label"] for a in ordered], ["Grok", "Kimi K3", "Cursor Ultra"])
+
+    def test_used_up_expiry_only_sorts_behind_open_reset(self):
+        grok = {"type": "grok", "label": "Grok", "expires_at": "2026-08-19T20:12:00"}
+        used = {"type": "time", "label": "OpenAI", "expires_at": "2026-08-19T21:38:00",
+                "used_up": True}
+        later = {"type": "cursor", "label": "Cursor Ultra", "started_at": "2026-08-13",
+                 "expires_at": "2026-09-13", "period": "monthly"}
+        now = datetime.datetime(2026, 8, 16, 12, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(q, "now_utc", return_value=now):
+            ordered = sorted([used, later, grok], key=lambda a: q._time_sort_key(self.cfg, a))
+        self.assertEqual([a["label"] for a in ordered], ["Grok", "Cursor Ultra", "OpenAI"])
+        self.assertIn("reset-only cards", q.PAGE_TEMPLATE)
 
     def test_time_mode_page_axis_and_summary(self):
         now = datetime.datetime(2026, 8, 20, 12, 0, tzinfo=datetime.timezone.utc)
