@@ -314,6 +314,22 @@ class TimeModeTests(unittest.TestCase):
             ordered = sorted([used, later], key=lambda a: q._time_sort_key(self.cfg, a))
         self.assertEqual([a["label"] for a in ordered], ["Cursor Ultra", "Grok"])
 
+    def test_blob_store_id_parses_rw_token(self):
+        with mock.patch.dict(os.environ, {
+            "BLOB_READ_WRITE_TOKEN": "vercel_blob_rw_LIDhdLSkb1wiD9ne_secret",
+            "BLOB_STORE_ID": "",
+        }, clear=False):
+            self.assertEqual(q.blob_store_id(), "LIDhdLSkb1wiD9ne")
+            self.assertIn("lidhdlskb1wid9ne.private.blob.vercel-storage.com",
+                          q.blob_private_url())
+
+    def test_blob_store_id_prefers_env(self):
+        with mock.patch.dict(os.environ, {
+            "BLOB_STORE_ID": "store_Abc123",
+            "BLOB_READ_WRITE_TOKEN": "vercel_blob_rw_other_secret",
+        }, clear=False):
+            self.assertEqual(q.blob_store_id(), "Abc123")
+
     def test_accounts_public_strips_credentials(self):
         rows = q.accounts_public([{
             "type": "glm", "label": "GLM Pro",

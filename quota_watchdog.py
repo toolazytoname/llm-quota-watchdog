@@ -219,6 +219,28 @@ def blob_token():
     return (os.environ.get("BLOB_READ_WRITE_TOKEN") or "").strip()
 
 
+def blob_store_id():
+    """Store id from env, or the rw-token form vercel_blob_rw_<storeId>_…"""
+    sid = (os.environ.get("BLOB_STORE_ID") or "").strip()
+    if sid.startswith("store_"):
+        sid = sid[len("store_"):]
+    if sid:
+        return sid
+    tok = blob_token()
+    parts = tok.split("_")
+    if len(parts) >= 5 and parts[0] == "vercel" and parts[1] == "blob" and parts[2] == "rw":
+        return parts[3]
+    return ""
+
+
+def blob_private_url(pathname=BLOB_PATHNAME):
+    sid = blob_store_id()
+    if not sid:
+        return ""
+    return "https://%s.private.blob.vercel-storage.com/%s" % (
+        sid.lower(), urllib.parse.quote(pathname, safe="/"))
+
+
 def accounts_public(accounts):
     """Date / used_up fields only — never api keys."""
     out = []
@@ -246,14 +268,24 @@ def blob_headers(extra=None):
 
 
 def blob_get_json(pathname=BLOB_PATHNAME):
-    """Return parsed JSON from a private blob, or None if missing / no token."""
+    """Return parsed JSON from a private blob, or None if missing / no token.
+
+    Content lives at ``{store}.private.blob.vercel-storage.com/{pathname}``.
+    Hitting blob.vercel-storage.com/{pathname} is 404, which previously made
+    every GET look empty and re-seed (wiping used_up).
+    """
     if not blob_token():
         return None
-    url = BLOB_API.rstrip("/") + "/" + urllib.parse.quote(pathname, safe="/")
+    url = blob_private_url(pathname)
+    if not url:
+        return None
+    # cache=0 bypasses CDN so a used_up write is visible on the next GET
+    url += ("&" if "?" in url else "?") + "cache=0"
     req = urllib.request.Request(url, headers=blob_headers())
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.load(resp)
+            data = json.load(resp)
+        return data if isinstance(data, dict) else None
     except urllib.error.HTTPError as e:
         if e.code in (404, 400):
             return None
@@ -325,12 +357,8 @@ def load_user_config(config_path):
         user["_store"] = "blob"
     else:
         user["_store"] = "config"
-        if blob_token() and user.get("accounts"):
-            try:
-                blob_put_json({"accounts": accounts_public(user["accounts"])})
-                user["_store"] = "blob"
-            except Exception:
-                pass
+        # Do not PUT on GET. Re-seeding here used to overwrite a successful
+        # used_up write with deploy-config (no checkmarks) on every page load.
     return user
 
 
@@ -2525,14 +2553,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var card = box.closest('.card');
     markUsedUp(card, on);
     apply();
-    postDates({label: label, used_up: on}).then(function(){
-      if (S.usedUp) delete S.usedUp[label];
-      save();
-    }).catch(function(){
-      S.usedUp = S.usedUp || {};
-      S.usedUp[label] = on;
-      save();
-    });
+    S.usedUp = S.usedUp || {};
+    S.usedUp[label] = on;
+    save();
+    postDates({label: label, used_up: on}).catch(function(){ /* local usedUp already saved */ });
   });
   function setTimeStatus(text){
     var el = document.getElementById('time-save-status');
