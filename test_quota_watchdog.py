@@ -267,8 +267,47 @@ class TimeModeTests(unittest.TestCase):
         self.assertIn('id="add-time"', q.PAGE_TEMPLATE)
         self.assertIn('id="set-times"', q.PAGE_TEMPLATE)
         self.assertIn("function applyTimes()", q.PAGE_TEMPLATE)
+        self.assertIn("function sweepUsedUp()", q.PAGE_TEMPLATE)
         self.assertIn("fetch('/dates'", q.PAGE_TEMPLATE)
         self.assertIn("保存到服务器", q.PAGE_TEMPLATE)
+
+    def test_used_up_releases_after_bound_reset(self):
+        acc = {
+            "type": "grok", "label": "Grok",
+            "expires_at": "2026-08-19T20:12:00",
+            "used_up": True, "used_up_until": "2026-08-19T20:12:00",
+        }
+        now = datetime.datetime(2026, 8, 19, 13, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(q, "now_utc", return_value=now):
+            changed = q.release_stale_used_up(self.cfg, [acc])
+        self.assertTrue(changed)
+        self.assertNotIn("used_up", acc)
+        self.assertNotIn("used_up_until", acc)
+
+    def test_used_up_stays_before_bound_reset(self):
+        acc = {
+            "type": "grok", "label": "Grok",
+            "expires_at": "2026-08-19T20:12:00",
+            "used_up": True, "used_up_until": "2026-08-19T20:12:00",
+        }
+        now = datetime.datetime(2026, 8, 19, 10, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(q, "now_utc", return_value=now):
+            changed = q.release_stale_used_up(self.cfg, [acc])
+        self.assertFalse(changed)
+        self.assertTrue(acc["used_up"])
+
+    def test_used_up_releases_even_if_monthly_cycle_rolled(self):
+        acc = {
+            "type": "time", "label": "Kimi K3",
+            "started_at": "2026-07-22", "expires_at": "2026-08-22",
+            "period": "monthly", "used_up": True,
+            "used_up_until": "2026-08-22T00:00:00+08:00",
+        }
+        now = datetime.datetime(2026, 8, 23, 4, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(q, "now_utc", return_value=now):
+            changed = q.release_stale_used_up(self.cfg, [acc])
+        self.assertTrue(changed)
+        self.assertNotIn("used_up", acc)
 
     def test_used_up_toggle_does_not_wipe_dates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -288,11 +327,73 @@ class TimeModeTests(unittest.TestCase):
             self.assertEqual(acc["started_at"], "2026-07-22")
             self.assertEqual(acc["expires_at"], "2026-08-22")
             self.assertTrue(acc["used_up"])
+            self.assertTrue(acc.get("used_up_until"))
             rec = q.normalize_time_record(cfg, {"label": "Kimi K3", "used_up": False})
             q.apply_time_record(path, rec)
             with open(path) as f:
                 acc = json.load(f)["accounts"][0]
             self.assertNotIn("used_up", acc)
+            self.assertNotIn("used_up_until", acc)
+
+    def test_used_up_without_until_releases_after_expiry(self):
+        acc = {
+            "type": "grok", "label": "Grok",
+            "expires_at": "2026-08-19T20:12:00",
+            "used_up": True,
+        }
+        now = datetime.datetime(2026, 8, 19, 13, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(q, "now_utc", return_value=now):
+            changed = q.release_stale_used_up(self.cfg, [acc])
+        self.assertTrue(changed)
+        self.assertNotIn("used_up", acc)
+
+    def test_used_up_without_until_stamps_deadline_while_active(self):
+        acc = {
+            "type": "grok", "label": "Grok",
+            "expires_at": "2026-08-19T20:12:00",
+            "used_up": True,
+        }
+        now = datetime.datetime(2026, 8, 16, 12, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch.object(q, "now_utc", return_value=now):
+            changed = q.release_stale_used_up(self.cfg, [acc])
+        self.assertTrue(changed)
+        self.assertTrue(acc["used_up"])
+        self.assertEqual(acc["used_up_until"], "2026-08-19T20:12:00")
+
+    def test_used_up_check_after_expiry_does_not_stick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w") as f:
+                json.dump({"timezone_offset_hours": 8, "accounts": [{
+                    "type": "grok", "label": "Grok",
+                    "expires_at": "2026-08-10T20:12:00",
+                }]}, f)
+            now = datetime.datetime(2026, 8, 16, 12, 0, tzinfo=datetime.timezone.utc)
+            with mock.patch.object(q, "now_utc", return_value=now):
+                cfg = q.load_config(path)
+                rec = q.normalize_time_record(cfg, {"label": "Grok", "used_up": True})
+                out = q.apply_time_record(path, rec)
+            self.assertFalse(out["account"].get("used_up"))
+
+    def test_load_user_config_persists_released_used_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w") as f:
+                json.dump({"timezone_offset_hours": 8, "accounts": [{
+                    "type": "grok", "label": "Grok",
+                    "expires_at": "2026-08-10T20:12:00",
+                    "used_up": True,
+                    "used_up_until": "2026-08-10T20:12:00",
+                }]}, f)
+            now = datetime.datetime(2026, 8, 16, 12, 0, tzinfo=datetime.timezone.utc)
+            with mock.patch.object(q, "now_utc", return_value=now), \
+                 mock.patch.object(q, "blob_token", return_value=""):
+                user = q.load_user_config(path)
+            self.assertFalse(user["accounts"][0].get("used_up"))
+            with open(path) as f:
+                saved = json.load(f)["accounts"][0]
+            self.assertFalse(saved.get("used_up"))
+            self.assertNotIn("used_up_until", saved)
 
     def test_monthly_period_without_start_rewinds_one_month(self):
         acct = {"type": "time", "label": "Kimi K3",

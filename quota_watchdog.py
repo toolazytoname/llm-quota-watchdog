@@ -253,6 +253,8 @@ def accounts_public(accounts):
                 row[key] = acc[key]
         if acc.get("used_up"):
             row["used_up"] = True
+            if acc.get("used_up_until"):
+                row["used_up_until"] = acc["used_up_until"]
         out.append(row)
     return out
 
@@ -332,8 +334,13 @@ def merge_store_accounts(user, overlay_accounts):
                 acc.pop(key, None)
         if overlay.get("used_up"):
             acc["used_up"] = True
+            if overlay.get("used_up_until"):
+                acc["used_up_until"] = overlay["used_up_until"]
+            else:
+                acc.pop("used_up_until", None)
         else:
             acc.pop("used_up", None)
+            acc.pop("used_up_until", None)
     for leftover in by_label.values():
         accounts.append(dict(leftover))
     user["accounts"] = accounts
@@ -359,6 +366,12 @@ def load_user_config(config_path):
         user["_store"] = "config"
         # Do not PUT on GET. Re-seeding here used to overwrite a successful
         # used_up write with deploy-config (no checkmarks) on every page load.
+    try:
+        cfg = load_config(config_path)
+        if release_stale_used_up(cfg, user.get("accounts") or []):
+            persist_user_config(config_path, user)
+    except Exception:
+        pass
     return user
 
 
@@ -1037,6 +1050,50 @@ def _as_bool(value):
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def format_wall_time(dt):
+    """Local wall clock, same shape as expires_at (no UTC rewrite)."""
+    if dt is None:
+        return ""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def used_up_deadline(cfg, acc):
+    """When this used-up mark expires.
+
+    Prefer the window captured at check time (``used_up_until``) so a later
+    monthly roll cannot carry the flag into the next cycle. Legacy rows
+    without that field fall back to the current window / expires_at.
+    """
+    raw = acc.get("used_up_until")
+    if raw:
+        parsed = parse_local_date(cfg, raw)
+        if parsed is not None:
+            return parsed
+    tw = account_time_window(cfg, acc)
+    if tw and tw.get("end"):
+        return tw["end"]
+    return account_expiry_dt(cfg, acc)
+
+
+def release_stale_used_up(cfg, accounts):
+    """Clear used_up after the bound reset/expiry. Returns True if anything changed."""
+    now = now_utc().astimezone(cfg["_tz"])
+    changed = False
+    for acc in accounts:
+        if not isinstance(acc, dict) or not acc.get("used_up"):
+            continue
+        until = used_up_deadline(cfg, acc)
+        if until is not None and now >= until:
+            acc.pop("used_up", None)
+            acc.pop("used_up_until", None)
+            changed = True
+            continue
+        if until is not None and not acc.get("used_up_until"):
+            acc["used_up_until"] = format_wall_time(until)
+            changed = True
+    return changed
+
+
 def apply_time_record(config_path, rec):
     """Write start/expiry onto one account in config.json.
 
@@ -1069,11 +1126,6 @@ def apply_time_record(config_path, rec):
     if found is None:
         found = {"type": "time", "label": label}
         accounts.append(found)
-    if "used_up" in rec:
-        if rec["used_up"]:
-            found["used_up"] = True
-        else:
-            found.pop("used_up", None)
     for key in TIME_RECORD_FIELDS:
         if key not in rec:
             continue
@@ -1081,6 +1133,21 @@ def apply_time_record(config_path, rec):
             found[key] = rec[key]
         else:
             found.pop(key, None)
+    cfg = load_config(config_path)
+    if "used_up" in rec:
+        if rec["used_up"]:
+            found["used_up"] = True
+            tw = account_time_window(cfg, found)
+            if tw and tw.get("end"):
+                found["used_up_until"] = format_wall_time(tw["end"])
+            elif found.get("expires_at"):
+                found["used_up_until"] = found["expires_at"]
+            else:
+                found.pop("used_up_until", None)
+        else:
+            found.pop("used_up", None)
+            found.pop("used_up_until", None)
+    release_stale_used_up(cfg, [found])
     persist_user_config(config_path, user)
     public = {"type": found.get("type") or "time", "label": label}
     for key in TIME_RECORD_FIELDS:
@@ -1088,6 +1155,8 @@ def apply_time_record(config_path, rec):
             public[key] = found[key]
     if found.get("used_up"):
         public["used_up"] = True
+        if found.get("used_up_until"):
+            public["used_up_until"] = found["used_up_until"]
     return {"ok": True, "account": public}
 
 def monthly_pace(pct, reset):
@@ -1851,7 +1920,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   function defaults(){
     return {v: 6, theme: 'auto', density: 'comfy', sort: 'expiry', order: [], orderCustomized: false, hidden: [],
             show: {badge: true, sub: true, reset: true, capacity: true, pace: true, fetched: true, expiry: true, summary: true},
-            autoRefresh: 0, times: {}, extraTimes: [], usedUp: {}};
+            autoRefresh: 0, times: {}, extraTimes: [], usedUp: {}, usedUpUntil: {}};
   }
   var S = defaults(), timer = null;
 
@@ -1876,6 +1945,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     if (raw.times && typeof raw.times === 'object') S.times = raw.times;
     if (Array.isArray(raw.extraTimes)) S.extraTimes = raw.extraTimes.slice();
     if (raw.usedUp && typeof raw.usedUp === 'object') S.usedUp = raw.usedUp;
+    if (raw.usedUpUntil && typeof raw.usedUpUntil === 'object') S.usedUpUntil = raw.usedUpUntil;
     if (raw.show) SHOW.forEach(function(p){
       if (raw.show[p[0]] !== undefined) S.show[p[0]] = !!raw.show[p[0]];
     });
@@ -2111,10 +2181,50 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       sub: ov.sub !== undefined ? ov.sub : ''
     };
   }
+  function parseUsedUntil(raw){
+    if (!raw) return null;
+    var ms = Date.parse(raw);
+    if (!isNaN(ms)) return new Date(ms);
+    return parseLocal(raw);
+  }
+  function usedUntilDate(card){
+    var name = acctOf(card);
+    var raw = (S.usedUpUntil && S.usedUpUntil[name]) || (card && card.getAttribute('data-used-until')) || '';
+    var until = parseUsedUntil(raw);
+    if (until) return until;
+    var spec = resolvedTime(card);
+    var tw = timeWindow(spec.started, spec.expires, spec.period);
+    return (tw && tw.end) || null;
+  }
   function isUsedUp(card){
     var name = acctOf(card);
-    if (S.usedUp && Object.prototype.hasOwnProperty.call(S.usedUp, name)) return !!S.usedUp[name];
-    return card.getAttribute('data-used-up') === '1';
+    var on = (S.usedUp && Object.prototype.hasOwnProperty.call(S.usedUp, name))
+      ? !!S.usedUp[name]
+      : (card.getAttribute('data-used-up') === '1');
+    if (!on) return false;
+    var until = usedUntilDate(card);
+    if (until && Date.now() >= until.getTime()) return false;
+    return true;
+  }
+  function sweepUsedUp(){
+    var cleared = [];
+    cards().forEach(function(card){
+      var name = acctOf(card);
+      var storedOn = (S.usedUp && Object.prototype.hasOwnProperty.call(S.usedUp, name))
+        ? !!S.usedUp[name]
+        : (card.getAttribute('data-used-up') === '1');
+      if (!storedOn || isUsedUp(card)) return;
+      markUsedUp(card, false);
+      if (S.usedUp) delete S.usedUp[name];
+      if (S.usedUpUntil) delete S.usedUpUntil[name];
+      card.removeAttribute('data-used-until');
+      cleared.push(name);
+    });
+    if (!cleared.length) return;
+    save();
+    cleared.forEach(function(label){
+      postDates({label: label, used_up: false}).catch(function(){});
+    });
   }
   function markUsedUp(card, on){
     if (!card) return;
@@ -2142,7 +2252,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   function extraCardHtml(item){
     var label = item.label || '未命名';
     var used = !!(item.used_up);
-    return '<div class="card' + (used ? ' used-up' : '') + '" data-account="' + escapeHtml(label) + '" data-provider="time" data-health="ok" data-track="time" data-extra="1" data-started="' + escapeHtml(item.started_at || '') + '" data-expires="' + escapeHtml(item.expires_at || '') + '" data-period="' + escapeHtml(item.period || '') + '" data-used-up="' + (used ? '1' : '0') + '">' +
+    return '<div class="card' + (used ? ' used-up' : '') + '" data-account="' + escapeHtml(label) + '" data-provider="time" data-health="ok" data-track="time" data-extra="1" data-started="' + escapeHtml(item.started_at || '') + '" data-expires="' + escapeHtml(item.expires_at || '') + '" data-period="' + escapeHtml(item.period || '') + '" data-used-up="' + (used ? '1' : '0') + '" data-used-until="' + escapeHtml(item.used_up_until || '') + '">' +
       '<h2><span class="title"><span>' + escapeHtml(label) + '</span>' + (item.sub ? '<span class="plan">' + escapeHtml(item.sub) + '</span>' : '') + '</span>' +
       '<span class="card-actions"><span class="badge b-ok"><i class="dot"></i></span>' +
       '<span class="drag-handle" role="button" tabindex="0" title="拖动账号调整顺序" aria-label="拖动账号调整顺序">拖动</span>' +
@@ -2162,6 +2272,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
   function applyTimes(){
     injectExtraTimes();
+    sweepUsedUp();
     cards().forEach(function(c){
       if (c.getAttribute('data-track') === 'time') paintTimeCard(c);
     });
@@ -2552,10 +2663,26 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     var on = !!box.checked;
     var card = box.closest('.card');
     markUsedUp(card, on);
-    apply();
     S.usedUp = S.usedUp || {};
     S.usedUp[label] = on;
+    S.usedUpUntil = S.usedUpUntil || {};
+    if (on) {
+      var spec = resolvedTime(card);
+      var tw = timeWindow(spec.started, spec.expires, spec.period);
+      var until = (tw && tw.end) ? tw.end.toISOString() : (spec.expires || '');
+      if (until) {
+        S.usedUpUntil[label] = until;
+        if (card) card.setAttribute('data-used-until', until);
+      } else {
+        delete S.usedUpUntil[label];
+        if (card) card.removeAttribute('data-used-until');
+      }
+    } else {
+      delete S.usedUpUntil[label];
+      if (card) card.removeAttribute('data-used-until');
+    }
     save();
+    apply();
     postDates({label: label, used_up: on}).catch(function(){ /* local usedUp already saved */ });
   });
   function setTimeStatus(text){
@@ -2741,8 +2868,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
         S.extraTimes.push({
           label: acc.label, sub: acc.sub || '',
           started_at: acc.started_at || '', expires_at: acc.expires_at || '',
-          period: acc.period || '', used_up: !!acc.used_up
+          period: acc.period || '', used_up: !!acc.used_up,
+          used_up_until: acc.used_up_until || ''
         });
+        if (S.usedUp) delete S.usedUp[acc.label];
+        S.usedUpUntil = S.usedUpUntil || {};
+        if (acc.used_up && acc.used_up_until) S.usedUpUntil[acc.label] = acc.used_up_until;
+        else delete S.usedUpUntil[acc.label];
         return;
       }
       if (acc.started_at !== undefined) card.setAttribute('data-started', acc.started_at || '');
@@ -2755,6 +2887,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       markUsedUp(card, !!acc.used_up);
       if (S.times) delete S.times[acc.label];
       if (S.usedUp) delete S.usedUp[acc.label];
+      S.usedUpUntil = S.usedUpUntil || {};
+      if (acc.used_up && acc.used_up_until) {
+        S.usedUpUntil[acc.label] = acc.used_up_until;
+        card.setAttribute('data-used-until', acc.used_up_until);
+      } else {
+        delete S.usedUpUntil[acc.label];
+        card.removeAttribute('data-used-until');
+      }
     });
   }
   load();
@@ -2765,6 +2905,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     })
     .catch(function(){})
     .then(function(){ apply(); save(); buildPanel(); });
+  document.addEventListener('visibilitychange', function(){
+    if (!document.hidden) apply();
+  });
+  setInterval(function(){ if (!document.hidden) apply(); }, 60000);
 })();
 </script>
 </body>
@@ -2883,12 +3027,13 @@ def time_card_html(cfg, acct, entry, health):
     started_raw = str(acct.get("started_at") or "")
     expires_raw = str(acct.get("expires_at") or (cfg.get("plan_expiry") or {}).get(label) or "")
     period_raw = "" if acct.get("period") in (None, "") else str(acct.get("period"))
+    used_until_raw = str(acct.get("used_up_until") or "") if used_up else ""
     card_cls = (" used-up" if used_up else "") + (" alert" if alert else "")
     used_box = ('<label class="used-up-toggle"><input type="checkbox" class="used-up-box" '
                 'data-account="%s"%s> 用完了</label>'
                 % (label_esc, " checked" if used_up else ""))
     return ('<div class="card%s" data-account="%s" data-provider="%s" data-health="%s" data-track="time" '
-            'data-started="%s" data-expires="%s" data-period="%s" data-used-up="%s">'
+            'data-started="%s" data-expires="%s" data-period="%s" data-used-up="%s" data-used-until="%s">'
             '<h2><span class="title"><span>%s</span>%s</span>'
             '<span class="card-actions">%s<span class="drag-handle" role="button" tabindex="0" title="拖动账号调整顺序" aria-label="拖动账号调整顺序">拖动</span>'
             '%s'
@@ -2897,7 +3042,7 @@ def time_card_html(cfg, acct, entry, health):
             '</span></h2><div class="wins">%s</div>%s<div class="fetched">%s</div></div>'
             % (card_cls, label_esc, provider_esc, html.escape(health or "ok"),
                html.escape(started_raw), html.escape(expires_raw), html.escape(period_raw),
-               "1" if used_up else "0",
+               "1" if used_up else "0", html.escape(used_until_raw),
                label_esc, sub_html, badge_html, used_box, label_esc,
                "/refresh?account=" + urllib.parse.quote(label), label_esc,
                "".join(rows), expiry_html, fetched_txt))
