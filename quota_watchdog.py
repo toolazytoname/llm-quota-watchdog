@@ -286,18 +286,23 @@ def blob_headers(extra=None):
     return headers
 
 
+class BlobUnavailable(Exception):
+    """Blob is configured but could not be read. Do not overwrite it."""
+
+
 def blob_get_json(pathname=BLOB_PATHNAME):
     """Return parsed JSON from a private blob, or None if missing / no token.
 
     Content lives at ``{store}.private.blob.vercel-storage.com/{pathname}``.
     Hitting blob.vercel-storage.com/{pathname} is 404, which previously made
-    every GET look empty and re-seed (wiping used_up).
+    every GET look empty and re-seed (wiping used_up). A network / 5xx failure
+    raises ``BlobUnavailable`` so callers do not persist seed data over Blob.
     """
     if not blob_token():
         return None
     url = blob_private_url(pathname)
     if not url:
-        return None
+        raise BlobUnavailable("无法解析 Blob 地址")
     # cache=0 bypasses CDN so a used_up write is visible on the next GET
     url += ("&" if "?" in url else "?") + "cache=0"
     req = urllib.request.Request(url, headers=blob_headers())
@@ -308,9 +313,9 @@ def blob_get_json(pathname=BLOB_PATHNAME):
     except urllib.error.HTTPError as e:
         if e.code in (404, 400):
             return None
-        raise
-    except (ValueError, OSError):
-        return None
+        raise BlobUnavailable("云端读取失败 HTTP %s" % e.code)
+    except (ValueError, OSError) as e:
+        raise BlobUnavailable("云端读取失败") from e
 
 
 def blob_put_json(data, pathname=BLOB_PATHNAME):
@@ -375,11 +380,17 @@ def load_user_config(config_path):
         user = {}
     if not isinstance(user.get("accounts"), list):
         user["accounts"] = list(user.get("accounts") or [])
-    blob = blob_get_json()
+    user["_blob_ok"] = True
+    try:
+        blob = blob_get_json()
+    except BlobUnavailable:
+        user["_store"] = "blob-error"
+        user["_blob_ok"] = False
+        blob = None
     if blob and isinstance(blob.get("accounts"), list):
         merge_store_accounts(user, blob["accounts"])
         user["_store"] = "blob"
-    else:
+    elif user.get("_blob_ok"):
         user["_store"] = "config"
         # Do not PUT on GET. Re-seeding here used to overwrite a successful
         # used_up write with deploy-config (no checkmarks) on every page load.
@@ -398,9 +409,12 @@ def load_user_config(config_path):
 def persist_user_config(config_path, user):
     payload = dict(user)
     payload.pop("_store", None)
+    payload.pop("_blob_ok", None)
     accounts = payload.get("accounts") or []
     store = "config"
     if blob_token():
+        if user.get("_blob_ok") is False:
+            raise ValueError("云端没读到，拒绝覆盖，请稍后重试")
         blob_put_json({"accounts": accounts_public(accounts)})
         store = "blob"
     path = os.path.expanduser(config_path)
@@ -1079,6 +1093,13 @@ def format_wall_time(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def format_offset_time(dt):
+    """ISO local time with offset so browsers don't guess the timezone."""
+    if dt is None:
+        return ""
+    return dt.isoformat(timespec="seconds")
+
+
 def format_stored_time(dt, previous=None):
     """Keep date-only values date-only when the stored string had no clock."""
     if dt is None:
@@ -1170,7 +1191,7 @@ def release_stale_used_up(cfg, accounts):
             changed = True
             continue
         if until is not None and not acc.get("used_up_until"):
-            acc["used_up_until"] = format_wall_time(until)
+            acc["used_up_until"] = format_offset_time(until)
             changed = True
     return changed
 
@@ -1220,7 +1241,7 @@ def apply_time_record(config_path, rec):
             found["used_up"] = True
             tw = account_time_window(cfg, found)
             if tw and tw.get("end"):
-                found["used_up_until"] = format_wall_time(tw["end"])
+                found["used_up_until"] = format_offset_time(tw["end"])
             elif found.get("expires_at"):
                 found["used_up_until"] = found["expires_at"]
             else:
@@ -1859,6 +1880,15 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     .card .wins { grid-template-columns: 1fr; gap: 20px; margin-top: 18px; }
     body.d-compact #chart-guide { grid-template-columns: 1fr; padding-left: 12px; padding-right: 12px; }
     body.d-compact .card { grid-template-columns: 1fr; column-gap: 0; padding: 13px 12px; }
+    body.d-mini .card { display: grid; grid-template-columns: 1fr; align-items: stretch; }
+    body.d-mini .card h2 { display: flex; }
+    body.d-mini .title { flex: 1 1 auto; }
+    body.d-mini .wins { grid-template-columns: 1fr; margin-top: 12px; }
+    body.d-mini .meta { display: flex; }
+    body.mode-time.d-mini .meta { display: flex; }
+    .set-field { flex-direction: column; align-items: stretch; }
+    .set-field input, .set-field select { max-width: none; width: 100%; }
+    .used-up-toggle input { width: 18px; height: 18px; }
   }
 
   /* per-item visibility toggles from the settings panel */

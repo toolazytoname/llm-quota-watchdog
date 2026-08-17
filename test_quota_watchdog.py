@@ -360,7 +360,7 @@ class TimeModeTests(unittest.TestCase):
             changed = q.release_stale_used_up(self.cfg, [acc])
         self.assertTrue(changed)
         self.assertTrue(acc["used_up"])
-        self.assertEqual(acc["used_up_until"], "2026-08-19T20:12:00")
+        self.assertEqual(acc["used_up_until"], "2026-08-19T20:12:00+08:00")
 
     def test_used_up_check_after_expiry_does_not_stick(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -625,6 +625,19 @@ class TimeModeTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(acc["started_at"], "2026-08-22")
         self.assertEqual(acc["expires_at"], "2026-09-22")
+
+    def test_persist_refuses_to_overwrite_blob_after_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w") as f:
+                json.dump({"accounts": [{"type": "grok", "label": "Grok",
+                                         "expires_at": "2026-08-19T20:12:00"}]}, f)
+            user = {"accounts": [{"label": "Grok", "used_up": True}], "_blob_ok": False}
+            with mock.patch.object(q, "blob_token", return_value="tok"), \
+                 mock.patch.object(q, "blob_put_json") as put:
+                with self.assertRaises(ValueError):
+                    q.persist_user_config(path, user)
+                put.assert_not_called()
 
     def test_write_key_required_only_when_configured(self):
         with mock.patch.object(q, "dates_write_key", return_value=""):
